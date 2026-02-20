@@ -27,6 +27,7 @@ if "history" not in st.session_state:
 
 if "last_run" not in st.session_state:
     st.session_state.last_run = {
+        "attempts": None,
         "has_result": False,
         "dataset_label": None,
         "question": None,
@@ -54,9 +55,90 @@ Rules:
 - If no chart is needed, set result_fig = None.
 - Keep code under 30 lines.
 - Do NOT print anything.
+- Do NOT create new columns in df (e.g., df['x']=...) unless the user explicitly asks to create a new column.
+- If the user asks for a column that doesn't exist, do NOT invent a replacement.
+  Instead set:
+    result_df = pd.DataFrame({"error":[<clear message>], "available_columns":[", ".join(df.columns)]})
+    result_fig = None
 """
 
+FIX_PROMPT = """
+You are a data analyst and debugger. You previously generated Python code that failed.
+Return ONLY corrected Python code.
 
+Rules:
+- A pandas DataFrame named df already exists.
+- Do NOT read/write files.
+- Do NOT use network calls.
+- Do NOT import any modules.
+- Put the final tabular answer in result_df (DataFrame) or None.
+- Put the final chart in result_fig (matplotlib Figure) or None.
+- If no chart is needed, set result_fig = None.
+- Keep code under 30 lines.
+- Do NOT print anything.
+- Do NOT create new columns in df (e.g., df['x']=...) unless the user explicitly asks to create a new column.
+- If the user asks for a column that doesn't exist, do NOT invent a replacement.
+  Instead set:
+    result_df = pd.DataFrame({"error":[<clear message>], "available_columns":[", ".join(df.columns)]})
+    result_fig = None
+"""
+
+def agent_run(df: pd.DataFrame, question: str, max_retries: int = 2):
+    attempts = []
+    code = generate_pandas_code(df, question)
+
+    for attempt in range(max_retries + 1):
+        code_clean = re.sub(r"^import .*$", "", code, flags=re.MULTILINE)
+        code_clean = re.sub(r"^from .*$", "", code_clean, flags=re.MULTILINE)
+        code_clean = code_clean.strip()
+
+        ok, reason = is_code_safe(code_clean)
+        if not ok:
+            attempts.append({
+                "attempt": attempt + 1,
+                "status": "blocked",
+                "reason": reason,
+                "code": code_clean
+            })
+            return None, None, code_clean, attempts, f"Blocked: {reason}"
+        
+        ok2, reason2 = validate_generated_code(code_clean, df)
+        if not ok2:
+            # Treat as an error so the fix-model rewrites it
+            attempts.append({
+                "attempt": attempt + 1,
+                "status": "validation_error",
+                "reason": reason2,
+                "code": code_clean
+            })
+
+            if attempt < max_retries:
+                code = fix_pandas_code(df, question, code_clean, f"ValidationError: {reason2}")
+                continue
+
+            return None, None, code_clean, attempts, f"Validation failed after retries: {reason2}"
+
+        result_df, result_fig, err = run_generated_code(df, code_clean)
+
+        if err is None:
+            attempts.append({
+                "attempt": attempt + 1,
+                "status": "success",
+                "code": code_clean
+            })
+            return result_df, result_fig, code_clean, attempts, None
+
+        attempts.append({
+            "attempt": attempt + 1,
+            "status": "error",
+            "error": err,
+            "code": code_clean
+        })
+
+        if attempt < max_retries:
+            code = fix_pandas_code(df, question, code_clean, err)
+
+    return None, None, code_clean, attempts, "Execution failed after retries."
 
 def strip_code_fences(code: str) -> str:
     code = code.strip()
@@ -104,6 +186,36 @@ def dataset_profile(df: pd.DataFrame) -> dict:
         })
     return prof
 
+def validate_generated_code(code: str, df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Prevent the model from 'cheating' by creating new columns like df['dummy']=1.
+    If it needs a derived column, user should explicitly ask for it.
+    """
+    existing = set(map(str, df.columns))
+
+    if re.search(r"^\s*df\s*=", code, flags=re.MULTILINE):
+        return False, "Model attempted to reassign df. Not allowed."
+
+    # Detect df['col'] = ... assignments
+    assigns = re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]\s*=", code)
+    for col in assigns:
+        if col not in existing:
+            return False, f"Model attempted to create new column '{col}'. Not allowed."
+
+    # Detect df['col'] usage (reads)
+    reads = re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]", code)
+    for col in reads:
+        # allow new column check is already handled separately
+        if col not in existing:
+            return False, f"Model referenced missing column '{col}'."
+
+    # Detect groupby('col') where col doesn't exist
+    gbs = re.findall(r"\.groupby\(\s*['\"]([^'\"]+)['\"]\s*\)", code)
+    for col in gbs:
+        if col not in existing:
+            return False, f"Model attempted to groupby missing column '{col}'."
+
+    return True, ""
 
 def is_code_safe(code: str) -> tuple[bool, str]:
     blocked_patterns = [
@@ -139,6 +251,32 @@ Return ONLY code.
     )
     return strip_code_fences(resp.choices[0].message.content)
 
+def fix_pandas_code(df: pd.DataFrame, question: str, bad_code: str, error_text: str) -> str:
+    prompt = f"""
+Dataset columns: {list(df.columns)}
+Sample rows (first 5): {df.head(5).to_dict(orient="records")}
+
+User question: {question}
+
+The code below failed:
+{bad_code}
+
+Error traceback:
+{error_text}
+
+Return ONLY corrected code.
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1",  # 🔥 Stronger model for fixing
+        messages=[
+            {"role": "system", "content": FIX_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+
+    return strip_code_fences(resp.choices[0].message.content)
 
 def generate_insights(question: str, result_df: pd.DataFrame) -> str:
     preview = result_df.head(12).to_dict(orient="records") if result_df is not None else []
@@ -227,6 +365,19 @@ JSON schema:
 
 
 def run_generated_code(df: pd.DataFrame, code: str):
+    safe_builtins = {
+        "len": len,
+        "min": min,
+        "max": max,
+        "sum": sum,
+        "abs": abs,
+        "range": range,
+        "sorted": sorted,
+        "round": round,
+        "enumerate": enumerate,
+        "zip": zip,
+    }
+
     local_env = {
         "df": df.copy(),
         "pd": pd,
@@ -235,8 +386,12 @@ def run_generated_code(df: pd.DataFrame, code: str):
         "result_df": None,
         "result_fig": None,
     }
-    exec(code, {"__builtins__": {}}, local_env)
-    return local_env.get("result_df"), local_env.get("result_fig")
+
+    try:
+        exec(code, {"__builtins__": safe_builtins}, local_env)
+        return local_env.get("result_df"), local_env.get("result_fig"), None
+    except Exception:
+        return None, None, traceback.format_exc()
 
 
 def build_markdown_report(dataset_name: str, question: str, code: str,
@@ -341,21 +496,14 @@ if uploaded:
             st.warning("Please enter a question.")
         else:
             try:
-                with st.spinner("Generating analysis code..."):
-                    code = generate_pandas_code(df, question)
+                with st.spinner("Running agentic analysis (self-healing)..."):
+                    result_df, result_fig, code, attempts, agent_err = agent_run(df, question, max_retries=2)
 
-                # Remove harmless import lines (we already provide pd/np/plt)
-                code = re.sub(r"^import .*$", "", code, flags=re.MULTILINE)
-                code = re.sub(r"^from .*$", "", code, flags=re.MULTILINE)
-                code = code.strip()
-
-                ok, reason = is_code_safe(code)
-                if not ok:
-                    st.error(f"Generated code blocked for safety. {reason}")
+                if agent_err:
+                    st.error(agent_err)
+                    with st.expander("🛠 Agent Attempt Logs"):
+                        st.json(attempts)
                 else:
-                    with st.spinner("Running analysis..."):
-                        result_df, result_fig = run_generated_code(df, code)
-
                     meta = None
                     if show_meta:
                         with st.spinner("Assessing complexity + bias/risk..."):
@@ -375,7 +523,7 @@ if uploaded:
                         meta=meta
                     )
 
-                    # ✅ Persist results for reruns (toggles won't clear output)
+                    #  Persist results for reruns (toggles won't clear output)
                     st.session_state.last_run = {
                         "has_result": True,
                         "dataset_label": dataset_label,
@@ -386,6 +534,7 @@ if uploaded:
                         "meta": meta,
                         "insights": insights_text,
                         "report_md": report_md,
+                        "attempts": attempts,   
                     }
 
                     # Save to history
@@ -407,6 +556,10 @@ if lr.get("has_result"):
     st.divider()
     st.subheader("✅ Latest Result")
     st.caption(f"Dataset: {lr['dataset_label']}")
+
+    if lr.get("attempts"):
+        with st.expander("🛠 Agent Attempts"):
+            st.json(lr["attempts"])
 
     if show_code and lr.get("code"):
         st.subheader("🧠 Generated Code")
