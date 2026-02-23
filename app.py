@@ -166,6 +166,84 @@ def load_table(uploaded_file, sheet_name=None):
     else:
         raise ValueError("Unsupported file type")
 
+def detect_date_range(df: pd.DataFrame):
+    """Try to find a date-like column and return (col_name, min_date, max_date) or (None, None, None)."""
+    for c in df.columns:
+        # Prefer obvious date columns
+        name = str(c).lower()
+        if any(k in name for k in ["date", "time", "timestamp", "order_date", "created", "dt"]):
+            s = pd.to_datetime(df[c], errors="coerce")
+            if s.notna().sum() >= max(5, int(0.1 * len(df))):  # enough valid dates
+                return c, s.min(), s.max()
+
+    # Fallback: try any column that parses well
+    for c in df.columns:
+        s = pd.to_datetime(df[c], errors="coerce")
+        if s.notna().sum() >= max(5, int(0.2 * len(df))):
+            return c, s.min(), s.max()
+
+    return None, None, None
+
+
+def phase2_summary_lite(df: pd.DataFrame) -> dict:
+    if df is None or df.empty:
+        return {"ok": False, "error": "No data loaded."}
+
+    rows, cols = df.shape
+
+    # Duplicates
+    dup_count = int(df.duplicated().sum())
+    dup_pct = round((dup_count / rows) * 100, 2) if rows else 0.0
+
+    # Missing %
+    missing_pct = (df.isna().sum() / rows * 100).round(2) if rows else pd.Series(dtype=float)
+    missing_sorted = missing_pct.sort_values(ascending=False)
+
+    # Top missing columns (only > 0)
+    top_missing = missing_sorted[missing_sorted > 0].head(5)
+    top_missing_dict = {k: float(v) for k, v in top_missing.items()}
+
+    # Date range (optional)
+    date_col, dmin, dmax = detect_date_range(df)
+
+    # Warnings (max 3)
+    warnings = []
+
+    # High missing columns
+    high_missing = missing_sorted[missing_sorted >= 20]
+    if len(high_missing) > 0:
+        warnings.append(f"{len(high_missing)} columns have ≥ 20% missing values")
+
+    # Duplicates
+    if dup_count > 0:
+        warnings.append(f"{dup_count} duplicate rows found ({dup_pct}%)")
+
+    # Basic sanity check: negative values in obvious money columns
+    money_like = [c for c in df.columns if any(k in str(c).lower() for k in ["revenue", "sales", "price", "amount", "profit"])]
+    for c in money_like[:6]:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            neg = int((df[c] < 0).sum())
+            if neg > 0:
+                warnings.append(f"'{c}' has {neg} negative values")
+                break
+
+    if not warnings:
+        warnings = ["Dataset looks healthy for analysis"]
+
+    return {
+        "ok": True,
+        "overview": {
+            "rows": int(rows),
+            "columns": int(cols),
+            "duplicate_rows": dup_count,
+            "duplicate_percent": dup_pct,
+            "date_col": date_col,
+            "date_min": None if dmin is None or pd.isna(dmin) else str(dmin.date() if hasattr(dmin, "date") else dmin),
+            "date_max": None if dmax is None or pd.isna(dmax) else str(dmax.date() if hasattr(dmax, "date") else dmax),
+        },
+        "warnings": warnings[:3],
+        "top_missing_columns": top_missing_dict,
+    }
 
 def dataset_profile(df: pd.DataFrame) -> dict:
     prof = {
@@ -479,6 +557,47 @@ if uploaded:
 
     st.subheader("📊 Dataset Preview")
     st.dataframe(df.head(10), use_container_width=True)
+
+    # ----------------------------
+    # Phase 2 (Lite): Data Quality Summary (3 blocks)
+    # ----------------------------
+    st.subheader("🧼 Data Quality Summary")
+
+    p2 = phase2_summary_lite(df)
+
+    if not p2.get("ok"):
+        st.info(p2.get("error", "No summary available."))
+    else:
+        ov = p2["overview"]
+
+        # BLOCK 1: Dataset Overview
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Rows", f"{ov['rows']:,}")
+        c2.metric("Columns", f"{ov['columns']:,}")
+        c3.metric("Duplicates", f"{ov['duplicate_rows']:,}")
+        c4.metric("Duplicate %", f"{ov['duplicate_percent']}%")
+
+        if ov.get("date_col") and ov.get("date_min") and ov.get("date_max"):
+            st.caption(f"Date range detected from **{ov['date_col']}**: {ov['date_min']} → {ov['date_max']}")
+
+        # BLOCK 2: Top Warnings (max 3)
+        st.markdown("### ⚠️ Data Health Warnings")
+        for w in p2["warnings"]:
+            if "healthy" in w.lower():
+                st.success(w)
+            else:
+                st.warning(w)
+
+        # BLOCK 3: Missing Values (Top 5)
+        st.markdown("### 🕳️ Missing Values (Top 5)")
+        miss = p2["top_missing_columns"]
+        if not miss:
+            st.success("No missing values detected.")
+        else:
+            miss_df = pd.DataFrame(
+                [{"Column": k, "Missing %": v} for k, v in miss.items()]
+            ).sort_values("Missing %", ascending=False)
+            st.dataframe(miss_df, use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("💬 Ask a question about your data")
