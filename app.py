@@ -206,32 +206,80 @@ def phase2_summary_lite(df: pd.DataFrame) -> dict:
     # Date range (optional)
     date_col, dmin, dmax = detect_date_range(df)
 
-    # Warnings (max 3)
-    warnings = []
+    # --- Issues for scoring ---
+    high_missing_20 = missing_sorted[missing_sorted >= 20]
+    high_missing_30 = missing_sorted[missing_sorted >= 30]
 
-    # High missing columns
-    high_missing = missing_sorted[missing_sorted >= 20]
-    if len(high_missing) > 0:
-        warnings.append(f"{len(high_missing)} columns have ≥ 20% missing values")
-
-    # Duplicates
-    if dup_count > 0:
-        warnings.append(f"{dup_count} duplicate rows found ({dup_pct}%)")
-
-    # Basic sanity check: negative values in obvious money columns
-    money_like = [c for c in df.columns if any(k in str(c).lower() for k in ["revenue", "sales", "price", "amount", "profit"])]
-    for c in money_like[:6]:
+    # Negative values in obvious money columns (profit/revenue/sales/etc.)
+    money_like = [c for c in df.columns if any(k in str(c).lower() for k in ["profit", "revenue", "sales", "price", "amount"])]
+    neg_issue = None
+    for c in money_like[:8]:
         if pd.api.types.is_numeric_dtype(df[c]):
             neg = int((df[c] < 0).sum())
             if neg > 0:
-                warnings.append(f"'{c}' has {neg} negative values")
+                neg_issue = (c, neg)
                 break
+
+    # --- Health status (Green/Yellow/Red) ---
+    # Red if: duplicates >=2% OR any column missing >=30% OR negative in profit/revenue present
+    # Yellow if: duplicates >0 OR any column missing >=10%
+    # Green otherwise
+    any_missing_10 = bool((missing_sorted >= 10).any())
+    is_red = (dup_pct >= 2.0) or (len(high_missing_30) > 0) or (neg_issue is not None)
+    is_yellow = (dup_count > 0) or any_missing_10
+
+    if is_red:
+        status = "RED"
+        status_text = "Risky"
+    elif is_yellow:
+        status = "YELLOW"
+        status_text = "Needs Attention"
+    else:
+        status = "GREEN"
+        status_text = "Healthy"
+
+    # --- Warnings (max 3, grammar fixed) ---
+    warnings = []
+
+    if len(high_missing_20) > 0:
+        n = len(high_missing_20)
+        warnings.append(f"{n} column{'s' if n != 1 else ''} ha{'ve' if n != 1 else 's'} ≥ 20% missing values")
+
+    if dup_count > 0:
+        warnings.append(f"{dup_count} duplicate row{'s' if dup_count != 1 else ''} found ({dup_pct}%)")
+
+    if neg_issue is not None:
+        col, neg = neg_issue
+        warnings.append(f"'{col}' has {neg} negative value{'s' if neg != 1 else ''}")
 
     if not warnings:
         warnings = ["Dataset looks healthy for analysis"]
 
+    # --- Suggested questions (agent vibe) ---
+    suggestions = []
+
+    if date_col:
+        # a safe, generic suggestion for time trend
+        suggestions.append(f"Plot monthly trend using {date_col}")
+
+    if top_missing_dict:
+        worst_col = next(iter(top_missing_dict.keys()))
+        suggestions.append(f"How many rows have missing {worst_col}?")
+
+    if neg_issue is not None:
+        col, _ = neg_issue
+        suggestions.append(f"Show rows where {col} < 0")
+
+    if len(suggestions) < 3:
+        suggestions.append("Show summary statistics for key numeric columns")
+
+    # Keep it short
+    suggestions = suggestions[:3]
+
     return {
         "ok": True,
+        "status": status,                 # GREEN / YELLOW / RED
+        "status_text": status_text,       # Healthy / Needs Attention / Risky
         "overview": {
             "rows": int(rows),
             "columns": int(cols),
@@ -243,6 +291,7 @@ def phase2_summary_lite(df: pd.DataFrame) -> dict:
         },
         "warnings": warnings[:3],
         "top_missing_columns": top_missing_dict,
+        "suggestions": suggestions,
     }
 
 def dataset_profile(df: pd.DataFrame) -> dict:
@@ -526,9 +575,11 @@ def build_markdown_report(dataset_name: str, question: str, code: str,
 # ----------------------------
 with st.sidebar:
     st.header("⚙️ Controls")
+    show_quality = st.toggle("Show Data Quality Summary", value=True)
     show_code = st.toggle("Show generated code", value=True)
     show_meta = st.toggle("Show complexity + bias/risk", value=True)
     generate_insight_toggle = st.toggle("Generate AI insights", value=True)
+    
 
     st.divider()
     st.subheader("🧾 History")
@@ -561,43 +612,71 @@ if uploaded:
     # ----------------------------
     # Phase 2 (Lite): Data Quality Summary (3 blocks)
     # ----------------------------
-    st.subheader("🧼 Data Quality Summary")
+    if show_quality:
+        st.subheader("🧼 Data Quality Summary")
+        p2 = phase2_summary_lite(df)
+
+        if not p2.get("ok"):
+            st.info(p2.get("error", "No summary available."))
+        else:
+            ov = p2["overview"]
+
+            # Status badge (Green/Yellow/Red) + legend
+            status = p2["status"]
+            status_text = p2["status_text"]
+
+            if status == "GREEN":
+                st.success(f"Status: {status} — {status_text}")
+            elif status == "YELLOW":
+                st.warning(f"Status: {status} — {status_text}")
+            else:
+                st.error(f"Status: {status} — {status_text}")
+
+            st.caption("Legend: 🟢 GREEN = Healthy   |   🟡 YELLOW = Needs Attention   |   🔴 RED = Risky")
+
+            # BLOCK 1: Dataset Overview
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Rows", f"{ov['rows']:,}")
+            c2.metric("Columns", f"{ov['columns']:,}")
+            c3.metric("Duplicates", f"{ov['duplicate_rows']:,}")
+            c4.metric("Duplicate %", f"{ov['duplicate_percent']}%")
+
+            if ov.get("date_col") and ov.get("date_min") and ov.get("date_max"):
+                st.caption(f"Date range detected from **{ov['date_col']}**: {ov['date_min']} → {ov['date_max']}")
+
+            # BLOCK 2: Top Warnings
+            st.markdown("### ⚠️ Data Health Warnings")
+            for w in p2["warnings"]:
+                if "healthy" in w.lower():
+                    st.success(w)
+                else:
+                    # Keep warnings consistent with status severity
+                    if status == "RED":
+                        st.error(w)
+                    elif status == "YELLOW":
+                        st.warning(w)
+                    else:
+                        st.info(w)
+
+            # BLOCK 3: Missing Values (Top 5)
+            st.markdown("### 🕳️ Missing Values (Top 5)")
+            miss = p2["top_missing_columns"]
+            if not miss:
+                st.success("No missing values detected.")
+            else:
+                miss_df = pd.DataFrame(
+                    [{"Column": k, "Missing %": v} for k, v in miss.items()]
+                ).sort_values("Missing %", ascending=False)
+                st.dataframe(miss_df, use_container_width=True, hide_index=True)
+
+            # Suggested questions (optional but impressive)
+            st.markdown("### 💡 Suggested Questions")
+            for s in p2.get("suggestions", []):
+                st.write(f"- {s}")
 
     p2 = phase2_summary_lite(df)
 
-    if not p2.get("ok"):
-        st.info(p2.get("error", "No summary available."))
-    else:
-        ov = p2["overview"]
-
-        # BLOCK 1: Dataset Overview
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Rows", f"{ov['rows']:,}")
-        c2.metric("Columns", f"{ov['columns']:,}")
-        c3.metric("Duplicates", f"{ov['duplicate_rows']:,}")
-        c4.metric("Duplicate %", f"{ov['duplicate_percent']}%")
-
-        if ov.get("date_col") and ov.get("date_min") and ov.get("date_max"):
-            st.caption(f"Date range detected from **{ov['date_col']}**: {ov['date_min']} → {ov['date_max']}")
-
-        # BLOCK 2: Top Warnings (max 3)
-        st.markdown("### ⚠️ Data Health Warnings")
-        for w in p2["warnings"]:
-            if "healthy" in w.lower():
-                st.success(w)
-            else:
-                st.warning(w)
-
-        # BLOCK 3: Missing Values (Top 5)
-        st.markdown("### 🕳️ Missing Values (Top 5)")
-        miss = p2["top_missing_columns"]
-        if not miss:
-            st.success("No missing values detected.")
-        else:
-            miss_df = pd.DataFrame(
-                [{"Column": k, "Missing %": v} for k, v in miss.items()]
-            ).sort_values("Missing %", ascending=False)
-            st.dataframe(miss_df, use_container_width=True, hide_index=True)
+    
 
     st.divider()
     st.subheader("💬 Ask a question about your data")
