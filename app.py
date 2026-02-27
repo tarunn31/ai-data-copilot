@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
+import dashboard_kpi as dk
 
 # ----------------------------
 # Setup
@@ -139,6 +140,17 @@ def agent_run(df: pd.DataFrame, question: str, max_retries: int = 2):
             code = fix_pandas_code(df, question, code_clean, err)
 
     return None, None, code_clean, attempts, "Execution failed after retries."
+
+def llm_exec_summary(prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": "Write concise executive bullet points. No fluff."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
 
 def strip_code_fences(code: str) -> str:
     code = code.strip()
@@ -293,6 +305,8 @@ def phase2_summary_lite(df: pd.DataFrame) -> dict:
         "top_missing_columns": top_missing_dict,
         "suggestions": suggestions,
     }
+
+
 
 def dataset_profile(df: pd.DataFrame) -> dict:
     prof = {
@@ -570,12 +584,152 @@ def build_markdown_report(dataset_name: str, question: str, code: str,
 
     return "\n".join(md)
 
+
+def render_executive_dashboard(df: pd.DataFrame, llm_callable=None):
+    st.subheader("📊 Executive Dashboard")
+
+    schema = dk.detect_schema(df)
+    spec = dk.compute_dashboard(df, schema)
+
+    # Keep UI clean: detected info is tucked away
+    with st.expander("What the agent detected (columns used)", expanded=False):
+        st.json(spec.get("detected", {}))
+
+    # KPI Cards (executive-style: 4 cards)
+    kpis = spec.get("kpis", [])
+    top_kpis = [k for k in kpis if k["label"] in ("Total Revenue", "Total Profit", "Profit Margin", "Avg Discount")]
+    cols = st.columns(4)
+    for i, k in enumerate(top_kpis[:4]):
+        cols[i].metric(k["label"], k["display"])
+
+    # --- Transparency: show what columns the agent used (clean + exec-friendly)
+    det = spec.get("detected", {})
+    cat0 = (det.get("category_cols") or ["—"])[0]
+
+    st.caption(
+        f"Using: date=`{det.get('used_date_col')}` | "
+        f"revenue=`{det.get('revenue_col')}` | "
+        f"profit=`{det.get('profit_col')}` | "
+        f"category=`{cat0}`"
+    )
+
+    det = spec.get("detected", {})
+    st.caption(
+        f"Using: date=`{det.get('used_date_col')}`, revenue=`{det.get('revenue_col')}`, "
+        f"profit=`{det.get('profit_col')}`, category=`{(det.get('category_cols') or ['—'])[0]}`"
+    )
+
+    st.divider()
+
+    ins = spec.get("exec_insights", {})
+    if ins:        
+        rev_mom = ins.get("revenue_mom_pct")
+        prof_mom = ins.get("profit_mom_pct")
+        rev_all = ins.get("revenue_overall_pct")
+        prof_all = ins.get("profit_overall_pct")
+
+        def pct(x):
+            return "—" if x is None else f"{x*100:.1f}%"
+
+        st.caption(
+            f"MoM Revenue: {pct(rev_mom)} | MoM Profit: {pct(prof_mom)}  •  "
+            f"Overall Revenue: {pct(rev_all)} | Overall Profit: {pct(prof_all)}"
+        )
+
+    st.divider()
+
+    # Charts (only show if available)
+    left, right = st.columns([1.2, 1])
+
+    trend_df = spec.get("trend")
+    if trend_df is not None and not trend_df.empty:
+        with left:
+            st.markdown("### Revenue Trend")
+            st.line_chart(trend_df.set_index("period")["revenue"])
+
+    profit_trend_df = spec.get("profit_trend")
+    if profit_trend_df is not None and not profit_trend_df.empty:
+        with left:
+            st.markdown("### Profit Trend")
+            st.line_chart(profit_trend_df.set_index("period")["profit"])
+
+    breakdown_df = spec.get("breakdown")
+    if breakdown_df is not None and not breakdown_df.empty:
+        with right:
+            st.markdown("### Top Categories by Revenue")
+            st.bar_chart(breakdown_df.set_index("category")["revenue"])
+
+    profit_breakdown_df = spec.get("profit_breakdown")
+    if profit_breakdown_df is not None and not profit_breakdown_df.empty:
+        with right:
+            st.markdown("### Top Categories by Profit")
+            st.bar_chart(profit_breakdown_df.set_index("category")["profit"])
+
+    profit_df = spec.get("profit_breakdown")
+    if profit_df is not None and not profit_df.empty:
+        st.markdown("### Top Categories by Profit")
+        st.bar_chart(profit_df.set_index("category")["profit"])
+
+    st.divider()
+
+    # Executive Summary
+    st.markdown("### Executive Summary")
+    prompt = dk.build_exec_summary_prompt(spec)
+
+    summary_text = None
+    if llm_callable is not None:
+        try:
+            summary_text = llm_callable(prompt)
+        except Exception:
+            summary_text = None
+
+    if not summary_text:
+        summary_text = (
+            "- KPIs are shown above.\n"
+            "- Trend and category charts appear when a valid date/category column is detected.\n"
+            "- (Optional) Wire LLM summary to generate a true executive narrative."
+        )
+
+    st.markdown(summary_text)
+
+    # --- Download dashboard spec (agent output)
+    with st.expander("⚙️ Dashboard Output (Advanced)"):
+        st.download_button(
+            label="⬇️ Download Dashboard Spec (JSON)",
+            data=json.dumps(spec, default=str, indent=2).encode("utf-8"),
+            file_name="executive_dashboard_spec.json",
+            mime="application/json",
+            key="download_exec_dashboard_spec_json",
+        )
+
+    return spec
+
+def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure df.columns are unique by appending .1, .2, ... to duplicates.
+    Also trims whitespace to avoid 'col' vs 'col ' issues.
+    """
+    df = df.copy()
+    cols = [str(c).strip() for c in df.columns]  # trim spaces
+    seen = {}
+    new_cols = []
+    for c in cols:
+        if c not in seen:
+            seen[c] = 0
+            new_cols.append(c)
+        else:
+            seen[c] += 1
+            new_cols.append(f"{c}.{seen[c]}")
+    df.columns = new_cols
+    return df
+
 # ----------------------------
 # UI
 # ----------------------------
 with st.sidebar:
     st.header("⚙️ Controls")
     show_quality = st.toggle("Show Data Quality Summary", value=True)
+    show_dashboard = st.toggle("Show Executive Dashboard", value=True)
     show_code = st.toggle("Show generated code", value=True)
     show_meta = st.toggle("Show complexity + bias/risk", value=True)
     generate_insight_toggle = st.toggle("Generate AI insights", value=True)
@@ -606,6 +760,21 @@ if uploaded:
 
     df = load_table(uploaded, sheet_name=sheet)
 
+    # Detect duplicates BEFORE fixing
+    raw_cols = [str(c).strip() for c in df.columns]
+    dupes = pd.Index(raw_cols)[pd.Index(raw_cols).duplicated()].tolist()
+
+    # Fix columns
+    df = make_unique_columns(df)
+    if not df.columns.is_unique:
+        st.error("Columns are STILL not unique after cleaning (unexpected).")
+        st.write("Duplicates:", df.columns[df.columns.duplicated()].tolist())
+        st.write(df.columns.tolist())
+
+    # Warn user if needed
+    if dupes:
+        st.warning(f"Duplicate column names detected and auto-renamed: {sorted(set(dupes))}")
+    
     st.subheader("📊 Dataset Preview")
     st.dataframe(df.head(10), use_container_width=True)
 
@@ -674,9 +843,13 @@ if uploaded:
             for s in p2.get("suggestions", []):
                 st.write(f"- {s}")
 
-    p2 = phase2_summary_lite(df)
-
-    
+    # ----------------------------
+    # Phase 3: KPI Auto Executive Dashboard
+    # ----------------------------
+    if show_dashboard:
+        spec = render_executive_dashboard(df, llm_callable=llm_exec_summary)
+        st.session_state.last_run = {**st.session_state.last_run, "kpi_spec": spec}
+        
 
     st.divider()
     st.subheader("💬 Ask a question about your data")
