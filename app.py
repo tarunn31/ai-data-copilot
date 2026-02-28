@@ -614,10 +614,7 @@ def render_executive_dashboard(df: pd.DataFrame, llm_callable=None):
     )
 
     det = spec.get("detected", {})
-    st.caption(
-        f"Using: date=`{det.get('used_date_col')}`, revenue=`{det.get('revenue_col')}`, "
-        f"profit=`{det.get('profit_col')}`, category=`{(det.get('category_cols') or ['—'])[0]}`"
-    )
+    
 
     st.divider()
 
@@ -726,21 +723,110 @@ def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------
 # UI
 # ----------------------------
+
+
 with st.sidebar:
     st.header("⚙️ Controls")
-    show_quality = st.toggle("Show Data Quality Summary", value=True)
-    show_dashboard = st.toggle("Show Executive Dashboard", value=True)
-    show_code = st.toggle("Show generated code", value=True)
-    show_meta = st.toggle("Show complexity + bias/risk", value=True)
-    generate_insight_toggle = st.toggle("Generate AI insights", value=True)
-    
+
+    # ----------------------------
+    # Persist defaults (set once)
+    # ----------------------------
+    if "mode" not in st.session_state:
+        st.session_state.mode = "Overview"
+
+    # View on/off toggles (NOT inside Advanced)
+    if "enable_overview" not in st.session_state:
+        st.session_state.enable_overview = True
+    if "enable_preview" not in st.session_state:
+        st.session_state.enable_preview = True
+    if "enable_quality" not in st.session_state:
+        st.session_state.enable_quality = True
+    if "enable_kpi" not in st.session_state:
+        st.session_state.enable_kpi = True
+    if "enable_askai" not in st.session_state:
+        st.session_state.enable_askai = True
+    if "enable_history" not in st.session_state:
+        st.session_state.enable_history = True
+
+    # AI output settings (only insights default ON)
+    if "show_code" not in st.session_state:
+        st.session_state.show_code = False
+    if "show_meta" not in st.session_state:
+        st.session_state.show_meta = False
+    if "generate_insight_toggle" not in st.session_state:
+        st.session_state.generate_insight_toggle = True  # ✅ default ON
+
+    # ----------------------------
+    # View dropdown (ALWAYS shows all)
+    # ----------------------------
+    all_views = ["Overview", "Data Preview", "Data Quality", "KPI Dashboard", "Ask AI", "History"]
+
+    st.session_state.mode = st.selectbox(
+        "View",
+        all_views,
+        index=all_views.index(st.session_state.mode) if st.session_state.mode in all_views else 0
+    )
+    mode = st.session_state.mode  # keep rest of app unchanged
 
     st.divider()
+
+    # ----------------------------
+    # On/Off toggles (right below View)
+    # ----------------------------
+    st.markdown("**Enable views**")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state.enable_overview = st.toggle("Overview", value=st.session_state.enable_overview)
+        st.session_state.enable_quality = st.toggle("Data Quality", value=st.session_state.enable_quality)
+        st.session_state.enable_askai = st.toggle("Ask AI", value=st.session_state.enable_askai)
+    with c2:
+        st.session_state.enable_preview = st.toggle("Data Preview", value=st.session_state.enable_preview)
+        st.session_state.enable_kpi = st.toggle("KPI Dashboard", value=st.session_state.enable_kpi)
+        st.session_state.enable_history = st.toggle("History", value=st.session_state.enable_history)
+
+    # If user is currently on a disabled view, bounce to Overview
+    enabled_map = {
+        "Overview": st.session_state.enable_overview,
+        "Data Preview": st.session_state.enable_preview,
+        "Data Quality": st.session_state.enable_quality,
+        "KPI Dashboard": st.session_state.enable_kpi,
+        "Ask AI": st.session_state.enable_askai,
+        "History": st.session_state.enable_history,
+    }
+    if not enabled_map.get(st.session_state.mode, True):
+        st.warning(f"'{st.session_state.mode}' is turned OFF. Switching to Overview.")
+        st.session_state.mode = "Overview"
+        mode = "Overview"
+
+    st.divider()
+
+    # ----------------------------
+    # Advanced: AI output settings only
+    # ----------------------------
+    with st.expander("Advanced (AI output settings)", expanded=False):
+        st.session_state.generate_insight_toggle = st.toggle(
+            "Generate AI insights",
+            value=st.session_state.generate_insight_toggle,  # ✅ default ON
+        )
+        # If you truly want ONLY insights, comment these out:
+        st.session_state.show_code = st.toggle("Show generated code", value=st.session_state.show_code)
+        st.session_state.show_meta = st.toggle("Show complexity + bias/risk", value=st.session_state.show_meta)
+
+    st.divider()
+
+    # ----------------------------
+    # History quick actions (optional)
+    # ----------------------------
     st.subheader("🧾 History")
     st.write(f"Saved runs: **{len(st.session_state.history)}**")
     if st.button("Clear history"):
         st.session_state.history = []
         st.success("History cleared.")
+
+# Make these available to the rest of your app (same variable names as before)
+show_code = st.session_state.show_code
+show_meta = st.session_state.show_meta
+generate_insight_toggle = st.session_state.generate_insight_toggle
 
 uploaded = st.file_uploader("Upload a file", type=["csv", "xlsx", "xls"])
 
@@ -760,6 +846,14 @@ if uploaded:
 
     df = load_table(uploaded, sheet_name=sheet)
 
+    if mode == "Overview":
+        st.subheader("✅ Dataset Loaded")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rows", f"{df.shape[0]:,}")
+        c2.metric("Columns", f"{df.shape[1]:,}")
+        c3.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
+        st.info("Use the sidebar to open Data Preview, Data Quality, KPI Dashboard, or Ask AI.")
+
     # Detect duplicates BEFORE fixing
     raw_cols = [str(c).strip() for c in df.columns]
     dupes = pd.Index(raw_cols)[pd.Index(raw_cols).duplicated()].tolist()
@@ -775,15 +869,17 @@ if uploaded:
     if dupes:
         st.warning(f"Duplicate column names detected and auto-renamed: {sorted(set(dupes))}")
     
-    st.subheader("📊 Dataset Preview")
-    st.dataframe(df.head(10), use_container_width=True)
+    if mode == "Data Preview":
+        st.subheader("📊 Dataset Preview")
+        st.dataframe(df.head(10), use_container_width=True)
 
     # ----------------------------
     # Phase 2 (Lite): Data Quality Summary (3 blocks)
     # ----------------------------
-    if show_quality:
-        st.subheader("🧼 Data Quality Summary")
-        p2 = phase2_summary_lite(df)
+    if mode == "Data Quality":
+        if mode == "Data Quality":
+            st.subheader("🧼 Data Quality Summary")
+            p2 = phase2_summary_lite(df)
 
         if not p2.get("ok"):
             st.info(p2.get("error", "No summary available."))
@@ -846,80 +942,81 @@ if uploaded:
     # ----------------------------
     # Phase 3: KPI Auto Executive Dashboard
     # ----------------------------
-    if show_dashboard:
+    if mode == "KPI Dashboard":
         spec = render_executive_dashboard(df, llm_callable=llm_exec_summary)
         st.session_state.last_run = {**st.session_state.last_run, "kpi_spec": spec}
         
 
     st.divider()
-    st.subheader("💬 Ask a question about your data")
-    question = st.text_input("Example: Plot monthly revenue trend")
+    if mode == "Ask AI":
+        st.subheader("💬 Ask a question about your data")
+        question = st.text_input("Example: Plot monthly revenue trend")
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        run_btn = st.button("Run AI Analysis", type="primary")
-    with colB:
-        st.caption("Tip: ask for a table or a chart (or both).")
+        colA, colB = st.columns([1, 1])
+        with colA:
+            run_btn = st.button("Run AI Analysis", type="primary")
+        with colB:
+            st.caption("Tip: ask for a table or a chart (or both).")
 
-    # -------- Run analysis (compute + STORE only) --------
-    if run_btn:
-        if not question.strip():
-            st.warning("Please enter a question.")
-        else:
-            try:
-                with st.spinner("Running agentic analysis (self-healing)..."):
-                    result_df, result_fig, code, attempts, agent_err = agent_run(df, question, max_retries=2)
+        # -------- Run analysis (compute + STORE only) --------
+        if run_btn:
+            if not question.strip():
+                st.warning("Please enter a question.")
+            else:
+                try:
+                    with st.spinner("Running agentic analysis (self-healing)..."):
+                        result_df, result_fig, code, attempts, agent_err = agent_run(df, question, max_retries=2)
 
-                if agent_err:
-                    st.error(agent_err)
-                    with st.expander("🛠 Agent Attempt Logs"):
-                        st.json(attempts)
-                else:
-                    meta = None
-                    if show_meta:
-                        with st.spinner("Assessing complexity + bias/risk..."):
-                            meta = analyze_query_and_risks(question, df, code, result_df)
+                    if agent_err:
+                        st.error(agent_err)
+                        with st.expander("🛠 Agent Attempt Logs"):
+                            st.json(attempts)
+                    else:
+                        meta = None
+                        if show_meta:
+                            with st.spinner("Assessing complexity + bias/risk..."):
+                                meta = analyze_query_and_risks(question, df, code, result_df)
 
-                    insights_text = None
-                    if generate_insight_toggle and isinstance(result_df, pd.DataFrame):
-                        with st.spinner("Generating insights..."):
-                            insights_text = generate_insights(question, result_df)
+                        insights_text = None
+                        if generate_insight_toggle and isinstance(result_df, pd.DataFrame):
+                            with st.spinner("Generating insights..."):
+                                insights_text = generate_insights(question, result_df)
 
-                    report_md = build_markdown_report(
-                        dataset_name=dataset_label,
-                        question=question,
-                        code=code,
-                        result_df=result_df if isinstance(result_df, pd.DataFrame) else None,
-                        insights=insights_text,
-                        meta=meta
-                    )
+                        report_md = build_markdown_report(
+                            dataset_name=dataset_label,
+                            question=question,
+                            code=code,
+                            result_df=result_df if isinstance(result_df, pd.DataFrame) else None,
+                            insights=insights_text,
+                            meta=meta
+                        )
 
-                    #  Persist results for reruns (toggles won't clear output)
-                    st.session_state.last_run = {
-                        "has_result": True,
-                        "dataset_label": dataset_label,
-                        "question": question,
-                        "code": code,
-                        "result_df": result_df,
-                        "result_fig": result_fig,
-                        "meta": meta,
-                        "insights": insights_text,
-                        "report_md": report_md,
-                        "attempts": attempts,   
-                    }
+                        #  Persist results for reruns (toggles won't clear output)
+                        st.session_state.last_run = {
+                            "has_result": True,
+                            "dataset_label": dataset_label,
+                            "question": question,
+                            "code": code,
+                            "result_df": result_df,
+                            "result_fig": result_fig,
+                            "meta": meta,
+                            "insights": insights_text,
+                            "report_md": report_md,
+                            "attempts": attempts,   
+                        }
 
-                    # Save to history
-                    st.session_state.history.append({
-                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "question": question,
-                        "code": code,
-                        "insights": insights_text,
-                        "result_preview": result_df.head(20).copy() if isinstance(result_df, pd.DataFrame) else None,
-                        "dataset": dataset_label,
-                    })
+                        # Save to history
+                        st.session_state.history.append({
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "question": question,
+                            "code": code,
+                            "insights": insights_text,
+                            "result_preview": result_df.head(20).copy() if isinstance(result_df, pd.DataFrame) else None,
+                            "dataset": dataset_label,
+                        })
 
-            except Exception as e:
-                st.error(f"Error: {e}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 # -------- Render persisted outputs (always) --------
 lr = st.session_state.last_run
@@ -976,14 +1073,15 @@ if lr.get("has_result"):
 # -------- History viewer --------
 if st.session_state.history:
     st.divider()
-    st.subheader("🧾 Run History (latest first)")
-    for item in reversed(st.session_state.history[-10:]):
-        with st.expander(f"{item['time']} — {item['question']}"):
-            st.write(f"**Dataset:** {item['dataset']}")
-            if show_code:
-                st.code(item["code"], language="python")
-            if item["result_preview"] is not None:
-                st.dataframe(item["result_preview"], use_container_width=True)
-            if item["insights"]:
-                st.markdown("**Insights:**")
-                st.write(item["insights"])
+    if mode == "History":
+        st.subheader("🧾 Run History (latest first)")
+        for item in reversed(st.session_state.history[-10:]):
+            with st.expander(f"{item['time']} — {item['question']}"):
+                st.write(f"**Dataset:** {item['dataset']}")
+                if show_code:
+                    st.code(item["code"], language="python")
+                if item["result_preview"] is not None:
+                    st.dataframe(item["result_preview"], use_container_width=True)
+                if item["insights"]:
+                    st.markdown("**Insights:**")
+                    st.write(item["insights"])
