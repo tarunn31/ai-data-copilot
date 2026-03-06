@@ -17,7 +17,13 @@ import dashboard_kpi as dk
 # Setup
 # ----------------------------
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=api_key)
+
+if not api_key:
+    st.error("OpenAI API key is missing. Please configure OPENAI_API_KEY in Streamlit secrets.")
+    st.stop()
 
 st.set_page_config(page_title="AI Data Copilot", layout="wide")
 

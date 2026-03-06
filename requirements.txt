@@ -1,7 +1,8 @@
 streamlit
 pandas
-plotly
 numpy
-python-dotenv
+plotly
+matplotlib
 openai
+python-dotenv
 openpyxl
