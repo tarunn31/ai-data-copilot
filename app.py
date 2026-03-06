@@ -6,7 +6,8 @@ from datetime import datetime
 
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
 import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -19,147 +20,102 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 st.set_page_config(page_title="AI Data Copilot", layout="wide")
-st.title("🤖 AI Data Analytics Copilot")
-st.caption("Upload a File → ask in English → get analysis + chart + insights.")
 
-# Session state: history + last run (so toggles don't wipe UI)
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "last_run" not in st.session_state:
-    st.session_state.last_run = {
-        "attempts": None,
-        "has_result": False,
-        "dataset_label": None,
-        "question": None,
-        "code": None,
-        "result_df": None,
-        "result_fig": None,
-        "meta": None,
-        "insights": None,
-        "report_md": None,
+# ---- Custom CSS: clean dark-accent theme ----
+st.markdown("""
+<style>
+    /* Main background */
+    .stApp { background-color: #0f1117; }
+    /* Metric cards */
+    [data-testid="metric-container"] {
+        background: #1a1d27;
+        border: 1px solid #2d3148;
+        border-radius: 10px;
+        padding: 14px 18px;
     }
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        background: #1a1d27;
+        border-radius: 8px;
+        padding: 6px 18px;
+        color: #8888aa;
+        font-weight: 500;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #3d5afe !important;
+        color: white !important;
+    }
+    /* Sidebar */
+    [data-testid="stSidebar"] { background-color: #13161f; }
+    /* Dividers */
+    hr { border-color: #2d3148; }
+    /* Section headers */
+    h3 { color: #c8d0e7; }
+    /* Dataframes */
+    .stDataFrame { border-radius: 8px; overflow: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🤖 AI Data Analytics Copilot")
+st.caption("Upload a file → explore → ask anything → get instant analysis.")
 
 # ----------------------------
-# Helpers
+# Session state
+# ----------------------------
+for key, default in [
+    ("history", []),
+    ("last_run", {
+        "has_result": False, "dataset_label": None, "question": None,
+        "code": None, "result_df": None, "result_fig": None,
+        "meta": None, "insights": None, "report_md": None, "attempts": None,
+        "text_answer": None,
+    }),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ----------------------------
+# Prompts
 # ----------------------------
 SYSTEM_PROMPT = """
-You are a data analyst. Generate ONLY Python code using pandas/numpy/matplotlib.
+You are an expert data analyst. Generate Python code using pandas, numpy, matplotlib,
+scipy, sklearn, or any other standard library as needed.
+
+A pandas DataFrame named `df` already exists in scope.
+Also available: pd, np, plt, scipy, sklearn (if installed).
 
 Rules:
-- A pandas DataFrame named df already exists.
-- Do NOT read/write files.
-- Do NOT use network calls.
-- Do NOT import any modules.
-- Put the final tabular answer in result_df (DataFrame) or None.
-- Put the final chart in result_fig (matplotlib Figure) or None.
-- If no chart is needed, set result_fig = None.
-- Keep code under 30 lines.
-- Do NOT print anything.
-- Do NOT create new columns in df (e.g., df['x']=...) unless the user explicitly asks to create a new column.
-- If the user asks for a column that doesn't exist, do NOT invent a replacement.
-  Instead set:
-    result_df = pd.DataFrame({"error":[<clear message>], "available_columns":[", ".join(df.columns)]})
+- Do NOT read or write files.
+- Do NOT make network calls.
+- Do NOT use os, sys, subprocess, or shell commands.
+- Put the final tabular answer in `result_df` (a DataFrame) or set it to None.
+- Put the final chart in `result_fig` (a matplotlib Figure) or set it to None.
+- Do NOT print anything; use result_df / result_fig for output.
+- If a column the user asks about does not exist, set:
+    result_df = pd.DataFrame({"error": ["Column not found"], "available_columns": [", ".join(df.columns)]})
     result_fig = None
 """
 
 FIX_PROMPT = """
-You are a data analyst and debugger. You previously generated Python code that failed.
-Return ONLY corrected Python code.
+You are an expert data analyst and debugger.
+The Python code below failed. Return ONLY corrected code.
 
-Rules:
-- A pandas DataFrame named df already exists.
-- Do NOT read/write files.
-- Do NOT use network calls.
-- Do NOT import any modules.
-- Put the final tabular answer in result_df (DataFrame) or None.
-- Put the final chart in result_fig (matplotlib Figure) or None.
-- If no chart is needed, set result_fig = None.
-- Keep code under 30 lines.
-- Do NOT print anything.
-- Do NOT create new columns in df (e.g., df['x']=...) unless the user explicitly asks to create a new column.
-- If the user asks for a column that doesn't exist, do NOT invent a replacement.
-  Instead set:
-    result_df = pd.DataFrame({"error":[<clear message>], "available_columns":[", ".join(df.columns)]})
-    result_fig = None
+A pandas DataFrame named `df` already exists.
+Available: pd, np, plt (matplotlib.pyplot).
+
+Rules: no file I/O, no network, no os/sys/subprocess.
+Output goes to result_df (DataFrame or None) and result_fig (matplotlib Figure or None).
 """
 
-def agent_run(df: pd.DataFrame, question: str, max_retries: int = 2):
-    attempts = []
-    code = generate_pandas_code(df, question)
-
-    for attempt in range(max_retries + 1):
-        code_clean = re.sub(r"^import .*$", "", code, flags=re.MULTILINE)
-        code_clean = re.sub(r"^from .*$", "", code_clean, flags=re.MULTILINE)
-        code_clean = code_clean.strip()
-
-        ok, reason = is_code_safe(code_clean)
-        if not ok:
-            attempts.append({
-                "attempt": attempt + 1,
-                "status": "blocked",
-                "reason": reason,
-                "code": code_clean
-            })
-            return None, None, code_clean, attempts, f"Blocked: {reason}"
-        
-        ok2, reason2 = validate_generated_code(code_clean, df)
-        if not ok2:
-            # Treat as an error so the fix-model rewrites it
-            attempts.append({
-                "attempt": attempt + 1,
-                "status": "validation_error",
-                "reason": reason2,
-                "code": code_clean
-            })
-
-            if attempt < max_retries:
-                code = fix_pandas_code(df, question, code_clean, f"ValidationError: {reason2}")
-                continue
-
-            return None, None, code_clean, attempts, f"Validation failed after retries: {reason2}"
-
-        result_df, result_fig, err = run_generated_code(df, code_clean)
-
-        if err is None:
-            attempts.append({
-                "attempt": attempt + 1,
-                "status": "success",
-                "code": code_clean
-            })
-            return result_df, result_fig, code_clean, attempts, None
-
-        attempts.append({
-            "attempt": attempt + 1,
-            "status": "error",
-            "error": err,
-            "code": code_clean
-        })
-
-        if attempt < max_retries:
-            code = fix_pandas_code(df, question, code_clean, err)
-
-    return None, None, code_clean, attempts, "Execution failed after retries."
-
-def llm_exec_summary(prompt: str) -> str:
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": "Write concise executive bullet points. No fluff."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
-
+# ----------------------------
+# Helpers
+# ----------------------------
 def strip_code_fences(code: str) -> str:
     code = code.strip()
     if code.startswith("```"):
         parts = code.split("```")
-        if len(parts) >= 3:
-            code = parts[1]
-        else:
-            code = code.replace("```", "")
+        code = parts[1] if len(parts) >= 3 else code.replace("```", "")
         code = code.strip()
         if code.startswith("python"):
             code = code[len("python"):].strip()
@@ -168,366 +124,69 @@ def strip_code_fences(code: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_table(uploaded_file, sheet_name=None):
-    # Streamlit file pointer can move; always reset.
     uploaded_file.seek(0)
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
         return pd.read_csv(uploaded_file)
-    elif name.endswith(".xlsx") or name.endswith(".xls"):
+    elif name.endswith((".xlsx", ".xls")):
         return pd.read_excel(uploaded_file, sheet_name=sheet_name)
-    else:
-        raise ValueError("Unsupported file type")
-
-def detect_date_range(df: pd.DataFrame):
-    """Try to find a date-like column and return (col_name, min_date, max_date) or (None, None, None)."""
-    for c in df.columns:
-        # Prefer obvious date columns
-        name = str(c).lower()
-        if any(k in name for k in ["date", "time", "timestamp", "order_date", "created", "dt"]):
-            s = pd.to_datetime(df[c], errors="coerce")
-            if s.notna().sum() >= max(5, int(0.1 * len(df))):  # enough valid dates
-                return c, s.min(), s.max()
-
-    # Fallback: try any column that parses well
-    for c in df.columns:
-        s = pd.to_datetime(df[c], errors="coerce")
-        if s.notna().sum() >= max(5, int(0.2 * len(df))):
-            return c, s.min(), s.max()
-
-    return None, None, None
+    raise ValueError("Unsupported file type")
 
 
-def phase2_summary_lite(df: pd.DataFrame) -> dict:
-    if df is None or df.empty:
-        return {"ok": False, "error": "No data loaded."}
-
-    rows, cols = df.shape
-
-    # Duplicates
-    dup_count = int(df.duplicated().sum())
-    dup_pct = round((dup_count / rows) * 100, 2) if rows else 0.0
-
-    # Missing %
-    missing_pct = (df.isna().sum() / rows * 100).round(2) if rows else pd.Series(dtype=float)
-    missing_sorted = missing_pct.sort_values(ascending=False)
-
-    # Top missing columns (only > 0)
-    top_missing = missing_sorted[missing_sorted > 0].head(5)
-    top_missing_dict = {k: float(v) for k, v in top_missing.items()}
-
-    # Date range (optional)
-    date_col, dmin, dmax = detect_date_range(df)
-
-    # --- Issues for scoring ---
-    high_missing_20 = missing_sorted[missing_sorted >= 20]
-    high_missing_30 = missing_sorted[missing_sorted >= 30]
-
-    # Negative values in obvious money columns (profit/revenue/sales/etc.)
-    money_like = [c for c in df.columns if any(k in str(c).lower() for k in ["profit", "revenue", "sales", "price", "amount"])]
-    neg_issue = None
-    for c in money_like[:8]:
-        if pd.api.types.is_numeric_dtype(df[c]):
-            neg = int((df[c] < 0).sum())
-            if neg > 0:
-                neg_issue = (c, neg)
-                break
-
-    # --- Health status (Green/Yellow/Red) ---
-    # Red if: duplicates >=2% OR any column missing >=30% OR negative in profit/revenue present
-    # Yellow if: duplicates >0 OR any column missing >=10%
-    # Green otherwise
-    any_missing_10 = bool((missing_sorted >= 10).any())
-    is_red = (dup_pct >= 2.0) or (len(high_missing_30) > 0) or (neg_issue is not None)
-    is_yellow = (dup_count > 0) or any_missing_10
-
-    if is_red:
-        status = "RED"
-        status_text = "Risky"
-    elif is_yellow:
-        status = "YELLOW"
-        status_text = "Needs Attention"
-    else:
-        status = "GREEN"
-        status_text = "Healthy"
-
-    # --- Warnings (max 3, grammar fixed) ---
-    warnings = []
-
-    if len(high_missing_20) > 0:
-        n = len(high_missing_20)
-        warnings.append(f"{n} column{'s' if n != 1 else ''} ha{'ve' if n != 1 else 's'} ≥ 20% missing values")
-
-    if dup_count > 0:
-        warnings.append(f"{dup_count} duplicate row{'s' if dup_count != 1 else ''} found ({dup_pct}%)")
-
-    if neg_issue is not None:
-        col, neg = neg_issue
-        warnings.append(f"'{col}' has {neg} negative value{'s' if neg != 1 else ''}")
-
-    if not warnings:
-        warnings = ["Dataset looks healthy for analysis"]
-
-    # --- Suggested questions (agent vibe) ---
-    suggestions = []
-
-    if date_col:
-        # a safe, generic suggestion for time trend
-        suggestions.append(f"Plot monthly trend using {date_col}")
-
-    if top_missing_dict:
-        worst_col = next(iter(top_missing_dict.keys()))
-        suggestions.append(f"How many rows have missing {worst_col}?")
-
-    if neg_issue is not None:
-        col, _ = neg_issue
-        suggestions.append(f"Show rows where {col} < 0")
-
-    if len(suggestions) < 3:
-        suggestions.append("Show summary statistics for key numeric columns")
-
-    # Keep it short
-    suggestions = suggestions[:3]
-
-    return {
-        "ok": True,
-        "status": status,                 # GREEN / YELLOW / RED
-        "status_text": status_text,       # Healthy / Needs Attention / Risky
-        "overview": {
-            "rows": int(rows),
-            "columns": int(cols),
-            "duplicate_rows": dup_count,
-            "duplicate_percent": dup_pct,
-            "date_col": date_col,
-            "date_min": None if dmin is None or pd.isna(dmin) else str(dmin.date() if hasattr(dmin, "date") else dmin),
-            "date_max": None if dmax is None or pd.isna(dmax) else str(dmax.date() if hasattr(dmax, "date") else dmax),
-        },
-        "warnings": warnings[:3],
-        "top_missing_columns": top_missing_dict,
-        "suggestions": suggestions,
-    }
-
+def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    cols = [str(c).strip() for c in df.columns]
+    seen: dict = {}
+    new_cols = []
+    for c in cols:
+        if c not in seen:
+            seen[c] = 0; new_cols.append(c)
+        else:
+            seen[c] += 1; new_cols.append(f"{c}.{seen[c]}")
+    df.columns = new_cols
+    return df
 
 
 def dataset_profile(df: pd.DataFrame) -> dict:
-    prof = {
+    return {
         "rows": int(df.shape[0]),
         "cols": int(df.shape[1]),
-        "columns": [],
+        "columns": [{"name": c, "dtype": str(df[c].dtype),
+                     "missing": int(df[c].isna().sum()),
+                     "nunique": int(df[c].nunique(dropna=True))}
+                    for c in df.columns[:30]],
         "missing_top": df.isna().sum().sort_values(ascending=False).head(8).to_dict(),
         "numeric_cols": df.select_dtypes(include="number").columns.tolist()[:20],
-        "object_cols": df.select_dtypes(include=["object"]).columns.tolist()[:20],
+        "object_cols":  df.select_dtypes(include="object").columns.tolist()[:20],
     }
-    for c in df.columns[:30]:
-        s = df[c]
-        prof["columns"].append({
-            "name": c,
-            "dtype": str(s.dtype),
-            "missing": int(s.isna().sum()),
-            "nunique": int(s.nunique(dropna=True)),
-        })
-    return prof
 
-def validate_generated_code(code: str, df: pd.DataFrame) -> tuple[bool, str]:
-    """
-    Prevent the model from 'cheating' by creating new columns like df['dummy']=1.
-    If it needs a derived column, user should explicitly ask for it.
-    """
-    existing = set(map(str, df.columns))
 
-    if re.search(r"^\s*df\s*=", code, flags=re.MULTILINE):
-        return False, "Model attempted to reassign df. Not allowed."
-
-    # Detect df['col'] = ... assignments
-    assigns = re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]\s*=", code)
-    for col in assigns:
-        if col not in existing:
-            return False, f"Model attempted to create new column '{col}'. Not allowed."
-
-    # Detect df['col'] usage (reads)
-    reads = re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]", code)
-    for col in reads:
-        # allow new column check is already handled separately
-        if col not in existing:
-            return False, f"Model referenced missing column '{col}'."
-
-    # Detect groupby('col') where col doesn't exist
-    gbs = re.findall(r"\.groupby\(\s*['\"]([^'\"]+)['\"]\s*\)", code)
-    for col in gbs:
-        if col not in existing:
-            return False, f"Model attempted to groupby missing column '{col}'."
-
-    return True, ""
-
-def is_code_safe(code: str) -> tuple[bool, str]:
-    blocked_patterns = [
-        r"\bimport\b", r"\bfrom\b",
-        r"os\.", r"sys\.", r"subprocess", r"shutil",
-        r"open\(", r"__import__", r"eval\(", r"exec\(",
-        r"pickle", r"joblib",
-        r"requests", r"http", r"socket",
-        r"\bwrite\b", r"\bto_csv\b", r"\bto_excel\b",
-    ]
-    for pat in blocked_patterns:
+def is_code_safe(code: str):
+    blocked = [r"os\.", r"sys\.", r"subprocess", r"shutil",
+               r"open\(", r"__import__", r"eval\(", r"exec\(",
+               r"pickle", r"requests", r"http", r"socket",
+               r"\bwrite\b", r"\bto_csv\b", r"\bto_excel\b"]
+    for pat in blocked:
         if re.search(pat, code):
             return False, f"Blocked unsafe pattern: `{pat}`"
     return True, ""
 
 
-def generate_pandas_code(df: pd.DataFrame, question: str) -> str:
-    prompt = f"""
-Dataset columns: {list(df.columns)}
-Sample rows (first 5): {df.head(5).to_dict(orient="records")}
-
-User question: {question}
-
-Return ONLY code.
-"""
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    return strip_code_fences(resp.choices[0].message.content)
-
-def fix_pandas_code(df: pd.DataFrame, question: str, bad_code: str, error_text: str) -> str:
-    prompt = f"""
-Dataset columns: {list(df.columns)}
-Sample rows (first 5): {df.head(5).to_dict(orient="records")}
-
-User question: {question}
-
-The code below failed:
-{bad_code}
-
-Error traceback:
-{error_text}
-
-Return ONLY corrected code.
-"""
-
-    resp = client.chat.completions.create(
-        model="gpt-4.1",  # 🔥 Stronger model for fixing
-        messages=[
-            {"role": "system", "content": FIX_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-
-    return strip_code_fences(resp.choices[0].message.content)
-
-def generate_insights(question: str, result_df: pd.DataFrame) -> str:
-    preview = result_df.head(12).to_dict(orient="records") if result_df is not None else []
-    prompt = f"""
-You are a business data analyst.
-
-User question: {question}
-
-Result preview (first rows):
-{preview}
-
-Write:
-- 3 concise insights (bullet points)
-- 1 recommendation
-- 1 caveat/assumption
-
-Be clear and non-technical.
-"""
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-    )
-    return resp.choices[0].message.content.strip()
-
-
-def analyze_query_and_risks(question: str, df: pd.DataFrame, code: str,
-                            result_df: pd.DataFrame | None) -> dict:
-    prof = dataset_profile(df)
-    result_preview = []
-    if isinstance(result_df, pd.DataFrame):
-        result_preview = result_df.head(10).to_dict(orient="records")
-
-    prompt = f"""
-Return ONLY valid JSON.
-
-User question:
-{question}
-
-Dataset profile:
-{json.dumps(prof)}
-
-Generated code:
-{code}
-
-Result preview:
-{json.dumps(result_preview)}
-
-Tasks:
-1) Query complexity:
-   - label: "Basic" | "Intermediate" | "Advanced"
-   - operations: list like ["aggregation","groupby","time-series","correlation","plotting","ranking","filtering"]
-   - confidence_score: 0-100
-
-2) Bias & risk detector (dataset + analysis):
-   - dataset_risks: list
-   - analysis_risks: list
-   - mitigations: list
-
-JSON schema:
-{{
-  "complexity": {{
-    "label": "...",
-    "operations": ["..."],
-    "confidence_score": 0
-  }},
-  "bias_risk": {{
-    "dataset_risks": ["..."],
-    "analysis_risks": ["..."],
-    "mitigations": ["..."]
-  }}
-}}
-"""
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    text = resp.choices[0].message.content.strip()
-
-    try:
-        return json.loads(text)
-    except Exception:
-        text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-
-
 def run_generated_code(df: pd.DataFrame, code: str):
-    safe_builtins = {
-        "len": len,
-        "min": min,
-        "max": max,
-        "sum": sum,
-        "abs": abs,
-        "range": range,
-        "sorted": sorted,
-        "round": round,
-        "enumerate": enumerate,
-        "zip": zip,
-    }
+    import matplotlib.pyplot as _plt
+    safe_builtins = {k: __builtins__[k] if isinstance(__builtins__, dict) else getattr(__builtins__, k, None)
+                     for k in ["len","min","max","sum","abs","range","sorted","round","enumerate","zip","list","dict","set","tuple","str","int","float","bool","print"]}
+    # provide scipy + sklearn if available
+    extra = {}
+    try:
+        import scipy; extra["scipy"] = scipy
+    except ImportError: pass
+    try:
+        import sklearn; extra["sklearn"] = sklearn
+    except ImportError: pass
 
-    local_env = {
-        "df": df.copy(),
-        "pd": pd,
-        "np": np,
-        "plt": plt,
-        "result_df": None,
-        "result_fig": None,
-    }
-
+    local_env = {"df": df.copy(), "pd": pd, "np": np, "plt": _plt,
+                 "result_df": None, "result_fig": None, **extra}
     try:
         exec(code, {"__builtins__": safe_builtins}, local_env)
         return local_env.get("result_df"), local_env.get("result_fig"), None
@@ -535,358 +194,440 @@ def run_generated_code(df: pd.DataFrame, code: str):
         return None, None, traceback.format_exc()
 
 
-def build_markdown_report(dataset_name: str, question: str, code: str,
-                          result_df: pd.DataFrame | None,
-                          insights: str | None,
-                          meta: dict | None) -> str:
+def generate_pandas_code(df: pd.DataFrame, question: str) -> str:
+    prompt = f"""Dataset columns: {list(df.columns)}
+Sample rows (first 5): {df.head(5).to_dict(orient='records')}
+
+User question: {question}
+
+Return ONLY Python code."""
+    resp = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                  {"role": "user",   "content": prompt}],
+        temperature=0.2,
+    )
+    return strip_code_fences(resp.choices[0].message.content)
+
+
+def fix_pandas_code(df: pd.DataFrame, question: str, bad_code: str, error_text: str) -> str:
+    prompt = f"""Dataset columns: {list(df.columns)}
+Sample rows (first 5): {df.head(5).to_dict(orient='records')}
+
+User question: {question}
+
+Failed code:
+{bad_code}
+
+Error:
+{error_text}
+
+Return ONLY corrected code."""
+    resp = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[{"role": "system", "content": FIX_PROMPT},
+                  {"role": "user",   "content": prompt}],
+        temperature=0.2,
+    )
+    return strip_code_fences(resp.choices[0].message.content)
+
+
+def is_analytical_question(question: str, df: pd.DataFrame) -> bool:
+    """Ask GPT whether this question needs code/data analysis or is a plain text question."""
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": "Answer only YES or NO."},
+            {"role": "user", "content":
+             f"The user has uploaded a dataset with columns: {list(df.columns)}.\n"
+             f"Does this question require data analysis, computation, aggregation, or chart generation?\n"
+             f"Question: {question}\nAnswer YES or NO."}
+        ],
+        temperature=0,
+    )
+    return resp.choices[0].message.content.strip().upper().startswith("Y")
+
+
+def answer_text_question(question: str, df: pd.DataFrame) -> str:
+    """Answer a non-analytical question using dataset context."""
+    sample = df.head(5).to_dict(orient="records")
+    col_info = [{"col": c, "dtype": str(df[c].dtype), "sample": str(df[c].dropna().iloc[0]) if not df[c].dropna().empty else ""}
+                for c in df.columns[:20]]
+    resp = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {"role": "system", "content":
+             "You are a helpful data analyst assistant. Answer questions about the dataset clearly and concisely. "
+             "Use the column names, types, and sample data provided to give a grounded, accurate answer."},
+            {"role": "user", "content":
+             f"Dataset overview:\nColumns: {json.dumps(col_info)}\nSample rows: {json.dumps(sample)}\n\nQuestion: {question}"}
+        ],
+        temperature=0.3,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def agent_run(df: pd.DataFrame, question: str, max_retries: int = 3):
+    attempts = []
+    code = generate_pandas_code(df, question)
+
+    for attempt in range(max_retries + 1):
+        # Strip import lines (model may add them; we re-inject via exec env)
+        code_clean = re.sub(r"^import (?!pandas|numpy|matplotlib|scipy|sklearn).*$", "", code, flags=re.MULTILINE)
+        code_clean = code_clean.strip()
+
+        ok, reason = is_code_safe(code_clean)
+        if not ok:
+            attempts.append({"attempt": attempt+1, "status": "blocked", "reason": reason, "code": code_clean})
+            return None, None, code_clean, attempts, f"Blocked: {reason}"
+
+        result_df, result_fig, err = run_generated_code(df, code_clean)
+        if err is None:
+            attempts.append({"attempt": attempt+1, "status": "success", "code": code_clean})
+            return result_df, result_fig, code_clean, attempts, None
+
+        attempts.append({"attempt": attempt+1, "status": "error", "error": err, "code": code_clean})
+        if attempt < max_retries:
+            code = fix_pandas_code(df, question, code_clean, err)
+
+    return None, None, code_clean, attempts, "Execution failed after retries."
+
+
+def generate_insights(question: str, result_df: pd.DataFrame) -> str:
+    preview = result_df.head(12).to_dict(orient="records") if result_df is not None else []
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content":
+                   f"You are a business data analyst.\nQuestion: {question}\nResult: {preview}\n"
+                   "Write: 3 concise insights (bullets), 1 recommendation, 1 caveat. Be clear, non-technical."}],
+        temperature=0.3,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def llm_exec_summary(prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "system", "content": "Write concise executive bullet points. No fluff."},
+                  {"role": "user",   "content": prompt}],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def generate_ai_quality_report(df: pd.DataFrame) -> str:
+    rows, cols = df.shape
+    missing = df.isna().sum()
+    missing_pct = (missing / rows * 100).round(2)
+    top_missing = missing_pct[missing_pct > 0].sort_values(ascending=False).head(8).to_dict()
+    dup_count = int(df.duplicated().sum())
+    dtypes = df.dtypes.astype(str).to_dict()
+    numeric_stats = df.describe().to_dict() if not df.select_dtypes(include="number").empty else {}
+
+    profile_txt = (
+        f"Rows: {rows}, Columns: {cols}\n"
+        f"Duplicate rows: {dup_count} ({round(dup_count/rows*100,2)}%)\n"
+        f"Columns with missing values: {json.dumps(top_missing)}\n"
+        f"Column dtypes: {json.dumps(dtypes)}\n"
+        f"Numeric stats (describe): {json.dumps(numeric_stats, default=str)}"
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {"role": "system", "content":
+             "You are a senior data quality analyst. Given a dataset profile, write a clear quality report. "
+             "Structure it as: (1) a metrics summary section, then (2) a narrative analysis. "
+             "The narrative should interpret what the numbers mean, flag risks, and give 2-3 actionable recommendations. "
+             "Use markdown formatting (headers, bullets). Be direct and specific."},
+            {"role": "user", "content": f"Dataset profile:\n{profile_txt}"}
+        ],
+        temperature=0.3,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def build_markdown_report(dataset_name, question, code, result_df, insights, meta=None) -> str:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    md = []
-    md.append("# AI Data Analytics Copilot Report\n")
-    md.append(f"**Generated:** {ts}\n")
-    md.append(f"**Dataset:** {dataset_name}\n")
-    md.append(f"**Question:** {question}\n")
-
-    if meta:
-        md.append("## Query Complexity\n")
-        md.append(f"- Level: {meta['complexity']['label']}\n")
-        md.append(f"- Confidence: {meta['complexity']['confidence_score']}%\n")
-        md.append(f"- Operations: {', '.join(meta['complexity']['operations'])}\n\n")
-
-        md.append("## Bias & Risk Detector\n")
-        md.append("**Dataset risks:**\n")
-        for r in meta["bias_risk"]["dataset_risks"]:
-            md.append(f"- {r}\n")
-        md.append("\n**Analysis risks:**\n")
-        for r in meta["bias_risk"]["analysis_risks"]:
-            md.append(f"- {r}\n")
-        md.append("\n**Mitigations:**\n")
-        for r in meta["bias_risk"]["mitigations"]:
-            md.append(f"- {r}\n")
-        md.append("\n")
-
-    md.append("## Generated Code\n")
-    md.append("```python\n" + (code or "").strip() + "\n```\n")
-
-    md.append("## Result (Preview)\n")
-    if result_df is not None and isinstance(result_df, pd.DataFrame):
-        md.append(result_df.head(20).to_markdown(index=False))
-        md.append("\n")
+    md = [f"# AI Data Analytics Copilot Report\n",
+          f"**Generated:** {ts}\n**Dataset:** {dataset_name}\n**Question:** {question}\n"]
+    md.append("## Generated Code\n```python\n" + (code or "").strip() + "\n```\n")
+    md.append("## Result\n")
+    if isinstance(result_df, pd.DataFrame):
+        md.append(result_df.head(20).to_markdown(index=False) + "\n")
     else:
-        md.append("_No table result produced._\n")
-
-    md.append("## AI Insights\n")
-    md.append(insights if insights else "_No insights generated._")
-    md.append("\n")
-
-    md.append("## Notes\n")
-    md.append("- Results depend on data quality and column meanings.\n")
-    md.append("- AI-generated code may require validation.\n")
-
+        md.append("_No table result._\n")
+    md.append(f"## AI Insights\n{insights or '_None._'}\n")
     return "\n".join(md)
 
 
-def render_executive_dashboard(df: pd.DataFrame, llm_callable=None):
-    st.subheader("📊 Executive Dashboard")
+# ----------------------------
+# Plotly chart helpers
+# ----------------------------
+PLOTLY_TEMPLATE = "plotly_dark"
 
+def plotly_line(df: pd.DataFrame, x: str, y: str, title: str, color: str = None):
+    fig = px.line(df, x=x, y=y, color=color, title=title, template=PLOTLY_TEMPLATE,
+                  markers=True)
+    fig.update_layout(hovermode="x unified", legend_title_text="")
+    return fig
+
+def plotly_bar(df: pd.DataFrame, x: str, y: str, title: str, orientation="v", color: str = None):
+    fig = px.bar(df, x=x, y=y, color=color, title=title, template=PLOTLY_TEMPLATE,
+                 orientation=orientation, text_auto=True)
+    fig.update_traces(textfont_size=11)
+    return fig
+
+def plotly_pie(df: pd.DataFrame, names: str, values: str, title: str):
+    fig = px.pie(df, names=names, values=values, title=title, template=PLOTLY_TEMPLATE,
+                 hole=0.35)
+    fig.update_traces(textinfo="percent+label")
+    return fig
+
+def plotly_corr_heatmap(corr_pairs: pd.DataFrame):
+    # pivot back to matrix
+    all_feats = sorted(set(corr_pairs["feature_a"].tolist() + corr_pairs["feature_b"].tolist()))
+    mat = pd.DataFrame(np.eye(len(all_feats)), index=all_feats, columns=all_feats)
+    for _, row in corr_pairs.iterrows():
+        mat.loc[row["feature_a"], row["feature_b"]] = row["corr"]
+        mat.loc[row["feature_b"], row["feature_a"]] = row["corr"]
+    fig = px.imshow(mat, text_auto=".2f", color_continuous_scale="RdBu_r",
+                    zmin=-1, zmax=1, title="Correlation Heatmap", template=PLOTLY_TEMPLATE,
+                    aspect="auto")
+    return fig
+
+
+# ----------------------------
+# KPI Dashboard renderer
+# ----------------------------
+def render_kpi_dashboard(df: pd.DataFrame, llm_callable=None):
     schema = dk.detect_schema(df)
-    spec = dk.compute_dashboard(df, schema)
+    spec   = dk.compute_dashboard(df, schema)
+    dtype  = spec.get("dashboard_type", "generic")
+    raw    = spec.get("raw", df)
 
-    dtype = spec.get("dashboard_type", "sales")
+    # ---- Minimal column check ----
+    num_cols = df.select_dtypes(include="number").columns.tolist()
+    if len(df.columns) < 2:
+        st.warning("⚠️ Dataset has too few columns to generate a meaningful dashboard.")
+        return
 
-    if dtype == "classification":
-        st.subheader("🧬 Smart Dashboard (Classification)")
-
-        # KPI cards
-        cols = st.columns(6)
-        for i, k in enumerate(spec.get("kpis", [])[:6]):
-            cols[i].metric(k["label"], k["display"])
-
-        cb = spec.get("class_balance")
-        if cb is not None and not cb.empty:
-            st.markdown("### Class Balance")
-            st.bar_chart(cb.set_index("class")["count"])
-
-        sep = spec.get("top_separation")
-        if sep is not None and not sep.empty:
-            st.markdown("### Top Differentiating Features")
-            st.dataframe(sep, use_container_width=True, hide_index=True)
-
-        corrp = spec.get("corr_pairs")
-        if corrp is not None and not corrp.empty:
-            st.markdown("### Strongest Correlations")
-            st.dataframe(corrp, use_container_width=True, hide_index=True)
-
-        numsum = spec.get("numeric_summary")
-        if numsum is not None and not numsum.empty:
-            st.markdown("### Numeric Summary (Top Features)")
-            st.dataframe(numsum, use_container_width=True, hide_index=True)
-
-        return spec
-
-    if dtype == "generic":
-        st.subheader("📌 Smart Dashboard (Generic)")
-
-        cols = st.columns(6)
-        for i, k in enumerate(spec.get("kpis", [])[:6]):
-            cols[i].metric(k["label"], k["display"])
-
-        corrp = spec.get("corr_pairs")
-        if corrp is not None and not corrp.empty:
-            st.markdown("### Strongest Correlations")
-            st.dataframe(corrp, use_container_width=True, hide_index=True)
-
-        numsum = spec.get("numeric_summary")
-        if numsum is not None and not numsum.empty:
-            st.markdown("### Numeric Summary")
-            st.dataframe(numsum, use_container_width=True, hide_index=True)
-
-        cat = spec.get("categorical_summaries", [])
-        if cat:
-            st.markdown("### Top Categories")
-            for block in cat:
-                st.markdown(f"**{block['col']}**")
-                st.dataframe(block["top_counts"], use_container_width=True, hide_index=True)
-
-        return spec
-
-    # Keep UI clean: detected info is tucked away
-    with st.expander("What the agent detected (columns used)", expanded=False):
-        st.json(spec.get("detected", {}))
-
-    # KPI Cards (executive-style: 4 cards)
+    # ---- KPI Cards ----
     kpis = spec.get("kpis", [])
-    top_kpis = [k for k in kpis if k["label"] in ("Total Revenue", "Total Profit", "Profit Margin", "Avg Discount")]
-    cols = st.columns(4)
-    for i, k in enumerate(top_kpis[:4]):
-        cols[i].metric(k["label"], k["display"])
-
-    # --- Transparency: show what columns the agent used (clean + exec-friendly)
-    det = spec.get("detected", {})
-    cat0 = (det.get("category_cols") or ["—"])[0]
-
-    st.caption(
-        f"Using: date=`{det.get('used_date_col')}` | "
-        f"revenue=`{det.get('revenue_col')}` | "
-        f"profit=`{det.get('profit_col')}` | "
-        f"category=`{cat0}`"
-    )
-
-    det = spec.get("detected", {})
-    
-
+    display_kpis = [k for k in kpis if k["display"] != "—"][:6]
+    if display_kpis:
+        cols_ui = st.columns(len(display_kpis))
+        for i, k in enumerate(display_kpis):
+            cols_ui[i].metric(k["label"], k["display"])
     st.divider()
 
-    ins = spec.get("exec_insights", {})
-    if ins:        
-        rev_mom = ins.get("revenue_mom_pct")
-        prof_mom = ins.get("profit_mom_pct")
-        rev_all = ins.get("revenue_overall_pct")
-        prof_all = ins.get("profit_overall_pct")
+    # ==========================
+    # SALES DASHBOARD
+    # ==========================
+    if dtype == "sales":
+        det = spec.get("detected", {})
+        category_cols = det.get("category_cols") or []
 
-        def pct(x):
-            return "—" if x is None else f"{x*100:.1f}%"
+        # --- Filters ---
+        with st.expander("🔧 Filters", expanded=False):
+            filter_col = st.selectbox("Filter by category column", ["(none)"] + category_cols, key="kpi_filter_col")
+            filter_val = None
+            if filter_col != "(none)":
+                unique_vals = sorted(raw[filter_col].dropna().astype(str).unique().tolist())
+                filter_val  = st.multiselect(f"Select {filter_col} values", unique_vals, default=unique_vals[:], key="kpi_filter_val")
 
-        st.caption(
-            f"MoM Revenue: {pct(rev_mom)} | MoM Profit: {pct(prof_mom)}  •  "
-            f"Overall Revenue: {pct(rev_all)} | Overall Profit: {pct(prof_all)}"
-        )
+        # Apply filter
+        filtered = raw.copy()
+        if filter_col != "(none)" and filter_val:
+            filtered = filtered[filtered[filter_col].astype(str).isin(filter_val)]
 
-    st.divider()
-
-    # Charts (only show if available)
-    left, right = st.columns([1.2, 1])
-
-    trend_df = spec.get("trend")
-    if trend_df is not None and not trend_df.empty:
-        with left:
-            st.markdown("### Revenue Trend")
-            st.line_chart(trend_df.set_index("period")["revenue"])
-
-    profit_trend_df = spec.get("profit_trend")
-    if profit_trend_df is not None and not profit_trend_df.empty:
-        with left:
-            st.markdown("### Profit Trend")
-            st.line_chart(profit_trend_df.set_index("period")["profit"])
-
-    breakdown_df = spec.get("breakdown")
-    if breakdown_df is not None and not breakdown_df.empty:
-        with right:
-            st.markdown("### Top Categories by Revenue")
-            st.bar_chart(breakdown_df.set_index("category")["revenue"])
-
-    profit_breakdown_df = spec.get("profit_breakdown")
-    if profit_breakdown_df is not None and not profit_breakdown_df.empty:
-        with right:
-            st.markdown("### Top Categories by Profit")
-            st.bar_chart(profit_breakdown_df.set_index("category")["profit"])
-
-    profit_df = spec.get("profit_breakdown")
-    if profit_df is not None and not profit_df.empty:
-        st.markdown("### Top Categories by Profit")
-        st.bar_chart(profit_df.set_index("category")["profit"])
-
-    st.divider()
-
-    # Executive Summary
-    st.markdown("### Executive Summary")
-    prompt = dk.build_exec_summary_prompt(spec)
-
-    summary_text = None
-    if llm_callable is not None:
-        try:
-            summary_text = llm_callable(prompt)
-        except Exception:
-            summary_text = None
-
-    if not summary_text:
-        summary_text = (
-            "- KPIs are shown above.\n"
-            "- Trend and category charts appear when a valid date/category column is detected.\n"
-            "- (Optional) Wire LLM summary to generate a true executive narrative."
-        )
-
-    st.markdown(summary_text)
-
-    # --- Download dashboard spec (agent output)
-    with st.expander("⚙️ Dashboard Output (Advanced)"):
-        st.download_button(
-            label="⬇️ Download Dashboard Spec (JSON)",
-            data=json.dumps(spec, default=str, indent=2).encode("utf-8"),
-            file_name="executive_dashboard_spec.json",
-            mime="application/json",
-            key="download_exec_dashboard_spec_json",
-        )
-
-    return spec
-
-def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure df.columns are unique by appending .1, .2, ... to duplicates.
-    Also trims whitespace to avoid 'col' vs 'col ' issues.
-    """
-    df = df.copy()
-    cols = [str(c).strip() for c in df.columns]  # trim spaces
-    seen = {}
-    new_cols = []
-    for c in cols:
-        if c not in seen:
-            seen[c] = 0
-            new_cols.append(c)
+        # Recompute spec on filtered data if needed
+        if filter_col != "(none)" and filter_val:
+            fschema = dk.detect_schema(filtered)
+            fspec   = dk.compute_dashboard(filtered, fschema)
+            trend_df          = fspec.get("trend")
+            profit_trend_df   = fspec.get("profit_trend")
+            breakdown_df      = fspec.get("breakdown")
+            profit_bdown_df   = fspec.get("profit_breakdown")
+            drill_df          = fspec.get("drill_data")
         else:
-            seen[c] += 1
-            new_cols.append(f"{c}.{seen[c]}")
-    df.columns = new_cols
-    return df
+            trend_df          = spec.get("trend")
+            profit_trend_df   = spec.get("profit_trend")
+            breakdown_df      = spec.get("breakdown")
+            profit_bdown_df   = spec.get("profit_breakdown")
+            drill_df          = spec.get("drill_data")
+
+        # --- Charts ---
+        col_l, col_r = st.columns(2)
+
+        if isinstance(trend_df, pd.DataFrame) and not trend_df.empty:
+            with col_l:
+                fig = plotly_line(trend_df, "period", "revenue", "📈 Revenue Trend")
+                st.plotly_chart(fig, use_container_width=True)
+
+        if isinstance(profit_trend_df, pd.DataFrame) and not profit_trend_df.empty:
+            with col_r:
+                fig = plotly_line(profit_trend_df, "period", "profit", "📈 Profit Trend")
+                st.plotly_chart(fig, use_container_width=True)
+
+        if isinstance(breakdown_df, pd.DataFrame) and not breakdown_df.empty:
+            with col_l:
+                fig = plotly_bar(breakdown_df, "revenue", "category",
+                                 "🏆 Top Categories by Revenue", orientation="h")
+                st.plotly_chart(fig, use_container_width=True)
+
+        if isinstance(profit_bdown_df, pd.DataFrame) and not profit_bdown_df.empty:
+            with col_r:
+                fig = plotly_bar(profit_bdown_df, "profit", "category",
+                                 "💰 Top Categories by Profit", orientation="h")
+                st.plotly_chart(fig, use_container_width=True)
+
+        # --- Drill-down ---
+        if isinstance(drill_df, pd.DataFrame) and not drill_df.empty:
+            st.markdown("### 🔍 Revenue Drill-down by Category")
+            avail_cats = sorted(drill_df["category"].astype(str).unique().tolist())
+            selected_cats = st.multiselect("Select categories to compare", avail_cats,
+                                           default=avail_cats[:5], key="drill_cats")
+            if selected_cats:
+                ddf = drill_df[drill_df["category"].astype(str).isin(selected_cats)]
+                fig = plotly_line(ddf, "period", "revenue", "Revenue Over Time by Category", color="category")
+                st.plotly_chart(fig, use_container_width=True)
+
+        # Revenue vs Profit scatter (if both exist)
+        rev_col  = det.get("revenue_col")
+        prof_col = det.get("profit_col")
+        if rev_col and prof_col and rev_col in filtered.columns and prof_col in filtered.columns:
+            st.markdown("### 🔵 Revenue vs Profit")
+            color_by = category_cols[0] if category_cols else None
+            fig = px.scatter(filtered, x=rev_col, y=prof_col, color=color_by,
+                             title="Revenue vs Profit", template=PLOTLY_TEMPLATE,
+                             opacity=0.7, hover_data=filtered.columns[:5].tolist())
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Summary tables
+        if isinstance(breakdown_df, pd.DataFrame) and not breakdown_df.empty:
+            with st.expander("📋 Revenue by Category (Table)"):
+                st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+        if isinstance(profit_bdown_df, pd.DataFrame) and not profit_bdown_df.empty:
+            with st.expander("📋 Profit by Category (Table)"):
+                st.dataframe(profit_bdown_df, use_container_width=True, hide_index=True)
+
+        # Executive summary
+        st.divider()
+        st.markdown("### 📝 Executive Summary")
+        prompt = dk.build_exec_summary_prompt(spec)
+        summary = llm_callable(prompt) if llm_callable else None
+        st.markdown(summary or "_Connect LLM to generate a narrative summary._")
+
+    # ==========================
+    # CLASSIFICATION DASHBOARD
+    # ==========================
+    elif dtype == "classification":
+        cb   = spec.get("class_balance")
+        sep  = spec.get("top_separation")
+        corr = spec.get("corr_pairs")
+        nums = spec.get("numeric_summary")
+
+        col_l, col_r = st.columns(2)
+
+        if isinstance(cb, pd.DataFrame) and not cb.empty:
+            with col_l:
+                fig = plotly_pie(cb, "class", "count", "🎯 Class Balance")
+                st.plotly_chart(fig, use_container_width=True)
+
+        if isinstance(sep, pd.DataFrame) and not sep.empty:
+            val_col = sep.columns[1]
+            with col_r:
+                fig = plotly_bar(sep.head(10), val_col, "feature",
+                                 "🔬 Top Differentiating Features", orientation="h")
+                st.plotly_chart(fig, use_container_width=True)
+
+        if isinstance(corr, pd.DataFrame) and not corr.empty and len(corr) >= 3:
+            fig = plotly_corr_heatmap(corr)
+            st.plotly_chart(fig, use_container_width=True)
+
+        if isinstance(nums, pd.DataFrame) and not nums.empty:
+            st.markdown("### 📊 Numeric Feature Summary")
+            st.dataframe(nums, use_container_width=True, hide_index=True)
+
+    # ==========================
+    # GENERIC DASHBOARD
+    # ==========================
+    else:
+        corr = spec.get("corr_pairs")
+        nums = spec.get("numeric_summary")
+        cats = spec.get("categorical_summaries", [])
+
+        if len(num_cols) < 2 and not cats:
+            st.info("ℹ️ Not enough structured columns to generate meaningful charts. "
+                    "Try the **Ask AI** tab for custom analysis.")
+            return
+
+        if isinstance(corr, pd.DataFrame) and not corr.empty and len(corr) >= 3:
+            fig = plotly_corr_heatmap(corr)
+            st.plotly_chart(fig, use_container_width=True)
+
+        if num_cols:
+            st.markdown("### 📊 Numeric Distributions")
+            sel = st.selectbox("Select column for distribution", num_cols[:20], key="dist_col")
+            fig = px.histogram(df, x=sel, nbins=40, title=f"Distribution of {sel}",
+                               template=PLOTLY_TEMPLATE, marginal="box")
+            st.plotly_chart(fig, use_container_width=True)
+
+        for block in cats:
+            c_name = block["col"]
+            vc = block["top_counts"]
+            fig = plotly_bar(vc, "count", c_name, f"Top Values: {c_name}", orientation="h")
+            st.plotly_chart(fig, use_container_width=True)
+
+        if isinstance(nums, pd.DataFrame) and not nums.empty:
+            st.markdown("### 📋 Numeric Summary Table")
+            st.dataframe(nums, use_container_width=True, hide_index=True)
+
+    # Export spec JSON
+    with st.expander("⚙️ Dashboard Spec (JSON)", expanded=False):
+        st.download_button(
+            label="⬇️ Download Dashboard Spec",
+            data=json.dumps(spec, default=str, indent=2).encode(),
+            file_name="dashboard_spec.json",
+            mime="application/json",
+            key="dl_dashboard_spec",
+        )
+
 
 # ----------------------------
-# UI
+# Sidebar
 # ----------------------------
-
-
 with st.sidebar:
     st.header("⚙️ Controls")
 
-    # ----------------------------
-    # Persist defaults (set once)
-    # ----------------------------
-    if "mode" not in st.session_state:
-        st.session_state.mode = "Overview"
+    for k, v in [("show_code", False), ("show_meta", False),
+                 ("generate_insight_toggle", True)]:
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # View on/off toggles (NOT inside Advanced)
-    if "enable_overview" not in st.session_state:
-        st.session_state.enable_overview = True
-    if "enable_preview" not in st.session_state:
-        st.session_state.enable_preview = True
-    if "enable_quality" not in st.session_state:
-        st.session_state.enable_quality = True
-    if "enable_kpi" not in st.session_state:
-        st.session_state.enable_kpi = True
-    if "enable_askai" not in st.session_state:
-        st.session_state.enable_askai = True
-    if "enable_history" not in st.session_state:
-        st.session_state.enable_history = True
-
-    # AI output settings (only insights default ON)
-    if "show_code" not in st.session_state:
-        st.session_state.show_code = False
-    if "show_meta" not in st.session_state:
-        st.session_state.show_meta = False
-    if "generate_insight_toggle" not in st.session_state:
-        st.session_state.generate_insight_toggle = True  # ✅ default ON
-
-    # ----------------------------
-    # View dropdown (ALWAYS shows all)
-    # ----------------------------
-    all_views = ["Overview", "Data Preview", "Data Quality", "KPI Dashboard", "Ask AI", "History"]
-
-    st.session_state.mode = st.selectbox(
-        "View",
-        all_views,
-        index=all_views.index(st.session_state.mode) if st.session_state.mode in all_views else 0
-    )
-    mode = st.session_state.mode  # keep rest of app unchanged
-
-    st.divider()
-
-    # ----------------------------
-    # On/Off toggles (right below View)
-    # ----------------------------
-    st.markdown("**Enable views**")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.session_state.enable_overview = st.toggle("Overview", value=st.session_state.enable_overview)
-        st.session_state.enable_quality = st.toggle("Data Quality", value=st.session_state.enable_quality)
-        st.session_state.enable_askai = st.toggle("Ask AI", value=st.session_state.enable_askai)
-    with c2:
-        st.session_state.enable_preview = st.toggle("Data Preview", value=st.session_state.enable_preview)
-        st.session_state.enable_kpi = st.toggle("KPI Dashboard", value=st.session_state.enable_kpi)
-        st.session_state.enable_history = st.toggle("History", value=st.session_state.enable_history)
-
-    # If user is currently on a disabled view, bounce to Overview
-    enabled_map = {
-        "Overview": st.session_state.enable_overview,
-        "Data Preview": st.session_state.enable_preview,
-        "Data Quality": st.session_state.enable_quality,
-        "KPI Dashboard": st.session_state.enable_kpi,
-        "Ask AI": st.session_state.enable_askai,
-        "History": st.session_state.enable_history,
-    }
-    if not enabled_map.get(st.session_state.mode, True):
-        st.warning(f"'{st.session_state.mode}' is turned OFF. Switching to Overview.")
-        st.session_state.mode = "Overview"
-        mode = "Overview"
-
-    st.divider()
-
-    # ----------------------------
-    # Advanced: AI output settings only
-    # ----------------------------
-    with st.expander("Advanced (AI output settings)", expanded=False):
+    with st.expander("AI Output Settings", expanded=False):
         st.session_state.generate_insight_toggle = st.toggle(
-            "Generate AI insights",
-            value=st.session_state.generate_insight_toggle,  # ✅ default ON
-        )
-        # If you truly want ONLY insights, comment these out:
-        st.session_state.show_code = st.toggle("Show generated code", value=st.session_state.show_code)
-        st.session_state.show_meta = st.toggle("Show complexity + bias/risk", value=st.session_state.show_meta)
+            "Generate AI insights", value=st.session_state.generate_insight_toggle)
+        st.session_state.show_code = st.toggle(
+            "Show generated code", value=st.session_state.show_code)
+        st.session_state.show_meta = st.toggle(
+            "Show complexity + bias/risk", value=st.session_state.show_meta)
 
     st.divider()
-
-    # ----------------------------
-    # History quick actions (optional)
-    # ----------------------------
     st.subheader("🧾 History")
     st.write(f"Saved runs: **{len(st.session_state.history)}**")
     if st.button("Clear history"):
         st.session_state.history = []
         st.success("History cleared.")
 
-# Make these available to the rest of your app (same variable names as before)
-show_code = st.session_state.show_code
-show_meta = st.session_state.show_meta
+show_code              = st.session_state.show_code
+show_meta              = st.session_state.show_meta
 generate_insight_toggle = st.session_state.generate_insight_toggle
 
-uploaded = st.file_uploader("Upload a file", type=["csv", "xlsx", "xls"])
+# ----------------------------
+# File upload
+# ----------------------------
+uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx", "xls"])
 
 sheet = None
 dataset_label = None
@@ -894,8 +635,6 @@ df = None
 
 if uploaded:
     dataset_label = uploaded.name
-
-    # Excel: sheet dropdown
     if uploaded.name.lower().endswith((".xlsx", ".xls")):
         uploaded.seek(0)
         xls = pd.ExcelFile(uploaded)
@@ -903,240 +642,236 @@ if uploaded:
         dataset_label = f"{uploaded.name} / {sheet}"
 
     df = load_table(uploaded, sheet_name=sheet)
+    raw_cols = [str(c).strip() for c in df.columns]
+    dupes = pd.Index(raw_cols)[pd.Index(raw_cols).duplicated()].tolist()
+    df = make_unique_columns(df)
+    if dupes:
+        st.warning(f"Duplicate column names auto-renamed: {sorted(set(dupes))}")
 
-    if mode == "Overview":
-        st.subheader("✅ Dataset Loaded")
-        c1, c2, c3 = st.columns(3)
+    # ----------------------------
+    # TABS
+    # ----------------------------
+    tab_overview, tab_quality, tab_kpi, tab_askai, tab_history = st.tabs(
+        ["📁 Overview & Preview", "🧼 Data Quality", "📊 KPI Dashboard", "💬 Ask AI", "🧾 History"]
+    )
+
+    # ========== TAB 1: Overview + Preview ==========
+    with tab_overview:
+        st.subheader("Dataset Overview")
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Rows", f"{df.shape[0]:,}")
         c2.metric("Columns", f"{df.shape[1]:,}")
         c3.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
-        st.info("Use the sidebar to open Data Preview, Data Quality, KPI Dashboard, or Ask AI.")
+        c4.metric("Duplicate rows", f"{int(df.duplicated().sum()):,}")
 
-    # Detect duplicates BEFORE fixing
-    raw_cols = [str(c).strip() for c in df.columns]
-    dupes = pd.Index(raw_cols)[pd.Index(raw_cols).duplicated()].tolist()
+        st.divider()
+        st.subheader("Data Preview")
+        n_rows = st.slider("Rows to display", 5, min(200, len(df)), 10, key="preview_slider")
+        st.dataframe(df.head(n_rows), use_container_width=True)
 
-    # Fix columns
-    df = make_unique_columns(df)
-    if not df.columns.is_unique:
-        st.error("Columns are STILL not unique after cleaning (unexpected).")
-        st.write("Duplicates:", df.columns[df.columns.duplicated()].tolist())
-        st.write(df.columns.tolist())
+        st.divider()
+        st.subheader("Column Info")
+        col_info = pd.DataFrame([{
+            "Column": c,
+            "Type": str(df[c].dtype),
+            "Non-null": int(df[c].notna().sum()),
+            "Missing %": f"{df[c].isna().mean()*100:.1f}%",
+            "Unique values": int(df[c].nunique(dropna=True)),
+            "Sample": str(df[c].dropna().iloc[0]) if not df[c].dropna().empty else "—",
+        } for c in df.columns])
+        st.dataframe(col_info, use_container_width=True, hide_index=True)
 
-    # Warn user if needed
-    if dupes:
-        st.warning(f"Duplicate column names detected and auto-renamed: {sorted(set(dupes))}")
-    
-    if mode == "Data Preview":
-        st.subheader("📊 Dataset Preview")
-        st.dataframe(df.head(10), use_container_width=True)
+    # ========== TAB 2: Data Quality ==========
+    with tab_quality:
+        st.subheader("🧼 AI-Powered Data Quality Report")
 
-    # ----------------------------
-    # Phase 2 (Lite): Data Quality Summary (3 blocks)
-    # ----------------------------
-    if mode == "Data Quality":
-        if mode == "Data Quality":
-            st.subheader("🧼 Data Quality Summary")
-            p2 = phase2_summary_lite(df)
+        # Always show hard metrics
+        rows, cols_n = df.shape
+        dup_count  = int(df.duplicated().sum())
+        miss_total = int(df.isna().sum().sum())
+        miss_pct   = (df.isna().sum() / rows * 100).round(2)
+        top_miss   = miss_pct[miss_pct > 0].sort_values(ascending=False).head(8)
 
-        if not p2.get("ok"):
-            st.info(p2.get("error", "No summary available."))
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Rows",           f"{rows:,}")
+        mc2.metric("Columns",        f"{cols_n:,}")
+        mc3.metric("Missing Cells",  f"{miss_total:,}")
+        mc4.metric("Duplicate Rows", f"{dup_count:,}")
+
+        if not top_miss.empty:
+            st.markdown("**Top columns with missing values:**")
+            miss_df = pd.DataFrame({"Column": top_miss.index, "Missing %": top_miss.values})
+            fig = plotly_bar(miss_df, "Missing %", "Column",
+                             "Missing Values by Column (%)", orientation="h")
+            fig.update_layout(height=max(250, len(top_miss) * 35))
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.markdown("### 🤖 AI Narrative Analysis")
+
+        if "quality_report" not in st.session_state or st.session_state.get("quality_dataset") != dataset_label:
+            if st.button("Generate AI Quality Report", type="primary"):
+                with st.spinner("Analysing data quality with AI..."):
+                    report = generate_ai_quality_report(df)
+                    st.session_state.quality_report   = report
+                    st.session_state.quality_dataset  = dataset_label
+                st.rerun()
         else:
-            ov = p2["overview"]
+            st.markdown(st.session_state.quality_report)
+            if st.button("Regenerate Report"):
+                del st.session_state["quality_report"]
+                st.rerun()
 
-            # Status badge (Green/Yellow/Red) + legend
-            status = p2["status"]
-            status_text = p2["status_text"]
+    # ========== TAB 3: KPI Dashboard ==========
+    with tab_kpi:
+        st.subheader("📊 Interactive KPI Dashboard")
+        render_kpi_dashboard(df, llm_callable=llm_exec_summary)
 
-            if status == "GREEN":
-                st.success(f"Status: {status} — {status_text}")
-            elif status == "YELLOW":
-                st.warning(f"Status: {status} — {status_text}")
-            else:
-                st.error(f"Status: {status} — {status_text}")
+    # ========== TAB 4: Ask AI ==========
+    with tab_askai:
+        st.subheader("💬 Ask Anything About Your Data")
+        question = st.text_input("Ask a question (analytical or exploratory)",
+                                 placeholder="e.g. What is the average revenue by category? / What does the Sales column represent?")
 
-            st.caption("Legend: 🟢 GREEN = Healthy   |   🟡 YELLOW = Needs Attention   |   🔴 RED = Risky")
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
+            run_btn = st.button("Run", type="primary")
+        with col_b:
+            st.caption("Can ask for tables, charts, summaries, or plain explanations.")
 
-            # BLOCK 1: Dataset Overview
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Rows", f"{ov['rows']:,}")
-            c2.metric("Columns", f"{ov['columns']:,}")
-            c3.metric("Duplicates", f"{ov['duplicate_rows']:,}")
-            c4.metric("Duplicate %", f"{ov['duplicate_percent']}%")
-
-            if ov.get("date_col") and ov.get("date_min") and ov.get("date_max"):
-                st.caption(f"Date range detected from **{ov['date_col']}**: {ov['date_min']} → {ov['date_max']}")
-
-            # BLOCK 2: Top Warnings
-            st.markdown("### ⚠️ Data Health Warnings")
-            for w in p2["warnings"]:
-                if "healthy" in w.lower():
-                    st.success(w)
-                else:
-                    # Keep warnings consistent with status severity
-                    if status == "RED":
-                        st.error(w)
-                    elif status == "YELLOW":
-                        st.warning(w)
-                    else:
-                        st.info(w)
-
-            # BLOCK 3: Missing Values (Top 5)
-            st.markdown("### 🕳️ Missing Values (Top 5)")
-            miss = p2["top_missing_columns"]
-            if not miss:
-                st.success("No missing values detected.")
-            else:
-                miss_df = pd.DataFrame(
-                    [{"Column": k, "Missing %": v} for k, v in miss.items()]
-                ).sort_values("Missing %", ascending=False)
-                st.dataframe(miss_df, use_container_width=True, hide_index=True)
-
-            
-
-    # ----------------------------
-    # Phase 3: KPI Auto Executive Dashboard
-    # ----------------------------
-    if mode == "KPI Dashboard":
-        spec = render_executive_dashboard(df, llm_callable=llm_exec_summary)
-        st.session_state.last_run = {**st.session_state.last_run, "kpi_spec": spec}
-        
-
-    st.divider()
-    if mode == "Ask AI":
-        st.subheader("💬 Ask a question about your data")
-        question = st.text_input("Example: Plot monthly revenue trend")
-
-        colA, colB = st.columns([1, 1])
-        with colA:
-            run_btn = st.button("Run AI Analysis", type="primary")
-        with colB:
-            st.caption("Tip: ask for a table or a chart (or both).")
-
-        # -------- Run analysis (compute + STORE only) --------
         if run_btn:
             if not question.strip():
                 st.warning("Please enter a question.")
             else:
-                try:
-                    with st.spinner("Running agentic analysis (self-healing)..."):
-                        result_df, result_fig, code, attempts, agent_err = agent_run(df, question, max_retries=2)
+                with st.spinner("Thinking..."):
+                    try:
+                        analytical = is_analytical_question(question, df)
 
-                    if agent_err:
-                        st.error(agent_err)
-                        with st.expander("🛠 Agent Attempt Logs"):
-                            st.json(attempts)
-                    else:
-                        meta = None
-                        if show_meta:
-                            with st.spinner("Assessing complexity + bias/risk..."):
-                                meta = analyze_query_and_risks(question, df, code, result_df)
+                        if analytical:
+                            result_df, result_fig, code, attempts, agent_err = agent_run(df, question, max_retries=3)
 
-                        insights_text = None
-                        if generate_insight_toggle and isinstance(result_df, pd.DataFrame):
-                            with st.spinner("Generating insights..."):
-                                insights_text = generate_insights(question, result_df)
+                            if agent_err:
+                                # Code failed — fall back to text answer
+                                text_answer = answer_text_question(question, df)
+                                st.session_state.last_run = {
+                                    **st.session_state.last_run,
+                                    "has_result": True,
+                                    "dataset_label": dataset_label,
+                                    "question": question,
+                                    "code": None,
+                                    "result_df": None,
+                                    "result_fig": None,
+                                    "insights": None,
+                                    "attempts": attempts,
+                                    "text_answer": text_answer,
+                                    "report_md": None,
+                                }
+                            else:
+                                insights_text = None
+                                if generate_insight_toggle and isinstance(result_df, pd.DataFrame):
+                                    insights_text = generate_insights(question, result_df)
 
-                        report_md = build_markdown_report(
-                            dataset_name=dataset_label,
-                            question=question,
-                            code=code,
-                            result_df=result_df if isinstance(result_df, pd.DataFrame) else None,
-                            insights=insights_text,
-                            meta=meta
-                        )
+                                report_md = build_markdown_report(
+                                    dataset_name=dataset_label, question=question,
+                                    code=code, result_df=result_df, insights=insights_text)
 
-                        #  Persist results for reruns (toggles won't clear output)
-                        st.session_state.last_run = {
-                            "has_result": True,
-                            "dataset_label": dataset_label,
-                            "question": question,
-                            "code": code,
-                            "result_df": result_df,
-                            "result_fig": result_fig,
-                            "meta": meta,
-                            "insights": insights_text,
-                            "report_md": report_md,
-                            "attempts": attempts,   
-                        }
+                                st.session_state.last_run = {
+                                    "has_result": True,
+                                    "dataset_label": dataset_label,
+                                    "question": question,
+                                    "code": code,
+                                    "result_df": result_df,
+                                    "result_fig": result_fig,
+                                    "meta": None,
+                                    "insights": insights_text,
+                                    "report_md": report_md,
+                                    "attempts": attempts,
+                                    "text_answer": None,
+                                }
+                                st.session_state.history.append({
+                                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "question": question,
+                                    "code": code,
+                                    "insights": insights_text,
+                                    "result_preview": result_df.head(20).copy() if isinstance(result_df, pd.DataFrame) else None,
+                                    "dataset": dataset_label,
+                                })
+                        else:
+                            # Plain text answer grounded in dataset context
+                            text_answer = answer_text_question(question, df)
+                            st.session_state.last_run = {
+                                **st.session_state.last_run,
+                                "has_result": True,
+                                "dataset_label": dataset_label,
+                                "question": question,
+                                "code": None,
+                                "result_df": None,
+                                "result_fig": None,
+                                "insights": None,
+                                "attempts": None,
+                                "text_answer": text_answer,
+                                "report_md": None,
+                            }
 
-                        # Save to history
-                        st.session_state.history.append({
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "question": question,
-                            "code": code,
-                            "insights": insights_text,
-                            "result_preview": result_df.head(20).copy() if isinstance(result_df, pd.DataFrame) else None,
-                            "dataset": dataset_label,
-                        })
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
-                except Exception as e:
-                    st.error(f"Error: {e}")
+        # ---- Render persisted results ----
+        lr = st.session_state.last_run
+        if lr.get("has_result") and lr.get("dataset_label") == dataset_label:
+            st.divider()
+            st.caption(f"**Q:** {lr.get('question', '')}")
 
-# -------- Render persisted outputs (always) --------
-lr = st.session_state.last_run
-if lr.get("has_result"):
-    st.divider()
-    st.subheader("✅ Latest Result")
-    st.caption(f"Dataset: {lr['dataset_label']}")
+            # Text answer (non-analytical or fallback)
+            if lr.get("text_answer"):
+                st.markdown("### 💬 Answer")
+                st.markdown(lr["text_answer"])
 
-    if lr.get("attempts"):
-        with st.expander("🛠 Agent Attempts"):
-            st.json(lr["attempts"])
+            if lr.get("attempts") and show_code:
+                with st.expander("🛠 Agent Attempts"):
+                    st.json(lr["attempts"])
 
-    if show_code and lr.get("code"):
-        st.subheader("🧠 Generated Code")
-        st.code(lr["code"], language="python")
+            if show_code and lr.get("code"):
+                with st.expander("🧠 Generated Code"):
+                    st.code(lr["code"], language="python")
 
-    if show_meta and lr.get("meta"):
-        meta = lr["meta"]
-        st.subheader("🧭 Query Complexity")
-        st.write(
-            f"**Level:** {meta['complexity']['label']}  |  "
-            f"**Confidence:** {meta['complexity']['confidence_score']}%"
-        )
-        st.write("**Operations:**", ", ".join(meta["complexity"]["operations"]))
+            if lr.get("result_df") is not None:
+                st.markdown("### 📋 Result Table")
+                st.dataframe(lr["result_df"], use_container_width=True)
 
-        st.subheader("⚠️ Bias & Risk Detector")
-        st.markdown("**Dataset risks**")
-        st.write(meta["bias_risk"]["dataset_risks"])
-        st.markdown("**Analysis risks**")
-        st.write(meta["bias_risk"]["analysis_risks"])
-        st.markdown("**Mitigations**")
-        st.write(meta["bias_risk"]["mitigations"])
+            if lr.get("result_fig") is not None:
+                st.markdown("### 📈 Chart")
+                st.pyplot(lr["result_fig"], clear_figure=True)
 
-    if lr.get("result_df") is not None:
-        st.subheader("📋 Result Table")
-        st.dataframe(lr["result_df"], use_container_width=True)
+            if generate_insight_toggle and lr.get("insights"):
+                st.markdown("### 🧠 AI Insights")
+                st.markdown(lr["insights"])
 
-    if lr.get("result_fig") is not None:
-        st.subheader("📈 Chart")
-        st.pyplot(lr["result_fig"], clear_figure=True)
+            if lr.get("report_md"):
+                st.download_button(
+                    label="⬇️ Download Report (Markdown)",
+                    data=lr["report_md"].encode(),
+                    file_name="ai_copilot_report.md",
+                    mime="text/markdown",
+                    key="dl_report",
+                )
 
-    if generate_insight_toggle and lr.get("insights"):
-        st.subheader("🧠 AI Insights")
-        st.write(lr["insights"])
-
-    if lr.get("report_md"):
-        st.download_button(
-            label="⬇️ Download report (Markdown)",
-            data=lr["report_md"].encode("utf-8"),
-            file_name="ai_data_copilot_report.md",
-            mime="text/markdown",
-        )
-
-# -------- History viewer --------
-if st.session_state.history:
-    st.divider()
-    if mode == "History":
+    # ========== TAB 5: History ==========
+    with tab_history:
         st.subheader("🧾 Run History (latest first)")
-        for item in reversed(st.session_state.history[-10:]):
-            with st.expander(f"{item['time']} — {item['question']}"):
-                st.write(f"**Dataset:** {item['dataset']}")
-                if show_code:
-                    st.code(item["code"], language="python")
-                if item["result_preview"] is not None:
-                    st.dataframe(item["result_preview"], use_container_width=True)
-                if item["insights"]:
-                    st.markdown("**Insights:**")
-                    st.write(item["insights"])
+        if not st.session_state.history:
+            st.info("No runs yet. Use Ask AI to get started.")
+        else:
+            for item in reversed(st.session_state.history[-20:]):
+                with st.expander(f"{item['time']} — {item['question']}"):
+                    st.write(f"**Dataset:** {item['dataset']}")
+                    if show_code and item.get("code"):
+                        st.code(item["code"], language="python")
+                    if item.get("result_preview") is not None:
+                        st.dataframe(item["result_preview"], use_container_width=True)
+                    if item.get("insights"):
+                        st.markdown("**Insights:**")
+                        st.markdown(item["insights"])
+
+else:
+    st.info("👆 Upload a CSV or Excel file to get started.")
