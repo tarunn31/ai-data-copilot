@@ -591,6 +591,64 @@ def render_executive_dashboard(df: pd.DataFrame, llm_callable=None):
     schema = dk.detect_schema(df)
     spec = dk.compute_dashboard(df, schema)
 
+    dtype = spec.get("dashboard_type", "sales")
+
+    if dtype == "classification":
+        st.subheader("🧬 Smart Dashboard (Classification)")
+
+        # KPI cards
+        cols = st.columns(6)
+        for i, k in enumerate(spec.get("kpis", [])[:6]):
+            cols[i].metric(k["label"], k["display"])
+
+        cb = spec.get("class_balance")
+        if cb is not None and not cb.empty:
+            st.markdown("### Class Balance")
+            st.bar_chart(cb.set_index("class")["count"])
+
+        sep = spec.get("top_separation")
+        if sep is not None and not sep.empty:
+            st.markdown("### Top Differentiating Features")
+            st.dataframe(sep, use_container_width=True, hide_index=True)
+
+        corrp = spec.get("corr_pairs")
+        if corrp is not None and not corrp.empty:
+            st.markdown("### Strongest Correlations")
+            st.dataframe(corrp, use_container_width=True, hide_index=True)
+
+        numsum = spec.get("numeric_summary")
+        if numsum is not None and not numsum.empty:
+            st.markdown("### Numeric Summary (Top Features)")
+            st.dataframe(numsum, use_container_width=True, hide_index=True)
+
+        return spec
+
+    if dtype == "generic":
+        st.subheader("📌 Smart Dashboard (Generic)")
+
+        cols = st.columns(6)
+        for i, k in enumerate(spec.get("kpis", [])[:6]):
+            cols[i].metric(k["label"], k["display"])
+
+        corrp = spec.get("corr_pairs")
+        if corrp is not None and not corrp.empty:
+            st.markdown("### Strongest Correlations")
+            st.dataframe(corrp, use_container_width=True, hide_index=True)
+
+        numsum = spec.get("numeric_summary")
+        if numsum is not None and not numsum.empty:
+            st.markdown("### Numeric Summary")
+            st.dataframe(numsum, use_container_width=True, hide_index=True)
+
+        cat = spec.get("categorical_summaries", [])
+        if cat:
+            st.markdown("### Top Categories")
+            for block in cat:
+                st.markdown(f"**{block['col']}**")
+                st.dataframe(block["top_counts"], use_container_width=True, hide_index=True)
+
+        return spec
+
     # Keep UI clean: detected info is tucked away
     with st.expander("What the agent detected (columns used)", expanded=False):
         st.json(spec.get("detected", {}))
@@ -934,10 +992,7 @@ if uploaded:
                 ).sort_values("Missing %", ascending=False)
                 st.dataframe(miss_df, use_container_width=True, hide_index=True)
 
-            # Suggested questions (optional but impressive)
-            st.markdown("### 💡 Suggested Questions")
-            for s in p2.get("suggestions", []):
-                st.write(f"- {s}")
+            
 
     # ----------------------------
     # Phase 3: KPI Auto Executive Dashboard
