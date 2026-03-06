@@ -57,7 +57,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🤖 AI Data Analytics Copilot")
+st.title("🤖 AI Data Analyst Copilot")
 st.caption("Upload a file → explore → ask anything → get instant analysis.")
 
 # ----------------------------
@@ -348,7 +348,7 @@ def generate_ai_quality_report(df: pd.DataFrame) -> str:
 
 def build_markdown_report(dataset_name, question, code, result_df, insights, meta=None) -> str:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    md = [f"# AI Data Analytics Copilot Report\n",
+    md = [f"# AI Data Analyst Copilot Report\n",
           f"**Generated:** {ts}\n**Dataset:** {dataset_name}\n**Question:** {question}\n"]
     md.append("## Generated Code\n```python\n" + (code or "").strip() + "\n```\n")
     md.append("## Result\n")
