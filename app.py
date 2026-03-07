@@ -83,6 +83,10 @@ st.caption("Upload a file → explore → ask anything → get instant analysis.
 # ----------------------------
 # Session state
 # ----------------------------
+
+if "use_sample" not in st.session_state:
+    st.session_state.use_sample = False
+
 for key, default in [
     ("history", []),
     ("last_run", {
@@ -654,6 +658,29 @@ generate_insight_toggle = st.session_state.generate_insight_toggle
 # ----------------------------
 
 uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx", "xls"])
+
+st.markdown("**Or try it instantly:**")
+if st.button("📂 Load Sample Dataset (Sales Data)"):
+    st.session_state.use_sample = True
+
+if uploaded is not None:
+    st.session_state.use_sample = False  # reset if user uploads their own file
+
+sheet = None
+dataset_label = None
+df = None
+
+if st.session_state.use_sample and uploaded is None:
+    try:
+        df = pd.read_csv("capstone_test_sales.csv")
+        dataset_label = "sample_sales_data.csv"
+        st.success("✅ Sample dataset loaded! Explore the tabs above.")
+    except FileNotFoundError:
+        st.error("Sample file not found. Make sure capstone_test_sales.csv is in the repo root.")
+
+elif uploaded:
+    dataset_label = uploaded.name
+    # ... rest of your existing uploaded block unchanged
 
 
 sheet = None
