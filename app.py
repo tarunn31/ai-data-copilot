@@ -672,7 +672,7 @@ df = None
 
 if st.session_state.use_sample and uploaded is None:
     try:
-        df = pd.read_csv("capstone_test_sales.csv")
+        df = pd.read_csv("test_sales.csv")
         dataset_label = "sample_sales_data.csv"
         st.success("✅ Sample dataset loaded! Explore the tabs above.")
     except FileNotFoundError:
