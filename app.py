@@ -643,6 +643,14 @@ show_meta              = st.session_state.show_meta
 generate_insight_toggle = st.session_state.generate_insight_toggle
 
 
+
+
+# ----------------------------
+# File upload
+# ----------------------------
+
+uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx", "xls"])
+
 st.markdown("---")
 st.markdown(
     """
@@ -653,11 +661,6 @@ st.markdown(
      """,
     unsafe_allow_html=True
 )
-# ----------------------------
-# File upload
-# ----------------------------
-
-uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx", "xls"])
 
 sheet = None
 dataset_label = None
