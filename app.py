@@ -643,6 +643,16 @@ show_meta              = st.session_state.show_meta
 generate_insight_toggle = st.session_state.generate_insight_toggle
 
 
+st.markdown("---")
+st.markdown(
+    """
+    <div style="text-align:center">
+    Built by <b>Sai Tarun Reddy</b><br>
+    <a href="https://github.com/tarunn31/ai-data-copilot">GitHub Repository</a>
+    </div>
+     """,
+    unsafe_allow_html=True
+)
 # ----------------------------
 # File upload
 # ----------------------------
@@ -896,11 +906,3 @@ if uploaded:
 else:
     st.info("👆 Upload a CSV or Excel file to get started.")
 
-st.markdown("---")
-
-st.markdown(
-"""
-Built by **Sai Tarun Reddy**  
-🔗 GitHub: https://github.com/tarunn31/ai-data-copilot
-"""
-)
