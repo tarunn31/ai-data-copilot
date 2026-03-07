@@ -27,6 +27,20 @@ if not api_key:
 
 st.set_page_config(page_title="AI Data Copilot", layout="wide")
 
+st.title("🤖 AI Data Analyst Copilot")
+
+st.markdown("""
+Upload a dataset (CSV or Excel) and let the AI analyze it.
+
+This app can:
+- 📊 Automatically generate KPI dashboards
+- 🔎 Explore dataset structure and quality
+- 💬 Answer questions about your data using AI
+- 📈 Provide executive insights
+
+⚠️ Please do not upload sensitive or confidential data.
+""")
+
 # ---- Custom CSS: clean dark-accent theme ----
 st.markdown("""
 <style>
@@ -630,9 +644,17 @@ show_code              = st.session_state.show_code
 show_meta              = st.session_state.show_meta
 generate_insight_toggle = st.session_state.generate_insight_toggle
 
+
+# ---- Sample dataset option ----
+if st.button("📂 Load Sample Dataset"):
+    df = pd.read_csv("sample_sales_data.csv")
+    st.success("Sample dataset loaded!")
+
+
 # ----------------------------
 # File upload
 # ----------------------------
+
 uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx", "xls"])
 
 sheet = None
@@ -881,3 +903,12 @@ if uploaded:
 
 else:
     st.info("👆 Upload a CSV or Excel file to get started.")
+
+st.markdown("---")
+
+st.markdown(
+"""
+Built by **Sai Tarun Reddy**  
+🔗 GitHub: https://github.com/tarunn31/ai-data-copilot
+"""
+)
