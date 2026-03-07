@@ -673,10 +673,10 @@ df = None
 if st.session_state.use_sample and uploaded is None:
     try:
         df = pd.read_csv("test_sales.csv")
-        dataset_label = "sample_sales_data.csv (demo)"
+        dataset_label = "test_sales.csv (demo)"
         st.success("✅ Sample dataset loaded! Explore the tabs above.")
     except FileNotFoundError:
-        st.error("Sample file not found. Make sure capstone_test_sales.csv is in the repo root.")
+        st.error("Sample file not found. Make sure test_sales.csv is in the repo root.")
 
 elif uploaded:
     dataset_label = uploaded.name
@@ -692,6 +692,7 @@ elif uploaded:
     if dupes:
         st.warning(f"Duplicate column names auto-renamed: {sorted(set(dupes))}")
 
+if df is not None:
     # ----------------------------
     # TABS
     # ----------------------------
