@@ -651,16 +651,6 @@ generate_insight_toggle = st.session_state.generate_insight_toggle
 
 uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx", "xls"])
 
-st.markdown("---")
-st.markdown(
-    """
-    <div style="text-align:center">
-    Built by <b>Sai Tarun Reddy</b><br>
-    <a href="https://github.com/tarunn31/ai-data-copilot">GitHub Repository</a>
-    </div>
-     """,
-    unsafe_allow_html=True
-)
 
 sheet = None
 dataset_label = None
@@ -909,3 +899,13 @@ if uploaded:
 else:
     st.info("👆 Upload a CSV or Excel file to get started.")
 
+st.markdown("---")
+st.markdown(
+    """
+    <div style="text-align:center">
+    Built by <b>Sai Tarun Reddy</b><br>
+    <a href="https://github.com/tarunn31/ai-data-copilot">GitHub Repository</a>
+    </div>
+     """,
+    unsafe_allow_html=True
+)
