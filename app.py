@@ -643,12 +643,6 @@ show_meta              = st.session_state.show_meta
 generate_insight_toggle = st.session_state.generate_insight_toggle
 
 
-# ---- Sample dataset option ----
-if st.button("📂 Load Sample Dataset"):
-    df = pd.read_csv("sample_sales_data.csv")
-    st.success("Sample dataset loaded!")
-
-
 # ----------------------------
 # File upload
 # ----------------------------
