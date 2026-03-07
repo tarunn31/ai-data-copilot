@@ -653,7 +653,7 @@ if st.button("📂 Load Sample Dataset"):
 # File upload
 # ----------------------------
 
-uploaded = st.file_uploader( type=["csv", "xlsx", "xls"])
+uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx", "xls"])
 
 sheet = None
 dataset_label = None
