@@ -95,6 +95,8 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
+
+
 # ----------------------------
 # Prompts
 # ----------------------------
@@ -109,6 +111,7 @@ Rules:
 - Do NOT read or write files.
 - Do NOT make network calls.
 - Do NOT use os, sys, subprocess, or shell commands.
+- Do NOT use libraries except streamlit, pandas, numpy, plotly, matplotlib, openai, python-dotenv, openpyxl, scikit-learn, tabulate
 - Put the final tabular answer in `result_df` (a DataFrame) or set it to None.
 - Put the final chart in `result_fig` (a matplotlib Figure) or set it to None.
 - Do NOT print anything; use result_df / result_fig for output.
