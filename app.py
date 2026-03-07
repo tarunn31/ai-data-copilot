@@ -664,7 +664,7 @@ if st.button("📂 Load Sample Dataset (Sales Data)"):
     st.session_state.use_sample = True
 
 if uploaded is not None:
-    st.session_state.use_sample = False  # reset if user uploads their own file
+    st.session_state.use_sample = False
 
 sheet = None
 dataset_label = None
@@ -673,28 +673,18 @@ df = None
 if st.session_state.use_sample and uploaded is None:
     try:
         df = pd.read_csv("test_sales.csv")
-        dataset_label = "sample_sales_data.csv"
+        dataset_label = "sample_sales_data.csv (demo)"
         st.success("✅ Sample dataset loaded! Explore the tabs above.")
     except FileNotFoundError:
         st.error("Sample file not found. Make sure capstone_test_sales.csv is in the repo root.")
 
 elif uploaded:
     dataset_label = uploaded.name
-    # ... rest of your existing uploaded block unchanged
-
-
-sheet = None
-dataset_label = None
-df = None
-
-if uploaded:
-    dataset_label = uploaded.name
     if uploaded.name.lower().endswith((".xlsx", ".xls")):
         uploaded.seek(0)
         xls = pd.ExcelFile(uploaded)
         sheet = st.selectbox("Select sheet", xls.sheet_names)
         dataset_label = f"{uploaded.name} / {sheet}"
-
     df = load_table(uploaded, sheet_name=sheet)
     raw_cols = [str(c).strip() for c in df.columns]
     dupes = pd.Index(raw_cols)[pd.Index(raw_cols).duplicated()].tolist()
