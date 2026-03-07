@@ -12,6 +12,8 @@ import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
 import dashboard_kpi as dk
+import sklearn
+import scipy
 
 # ----------------------------
 # Setup
@@ -641,7 +643,6 @@ with st.sidebar:
 show_code              = st.session_state.show_code
 show_meta              = st.session_state.show_meta
 generate_insight_toggle = st.session_state.generate_insight_toggle
-
 
 
 

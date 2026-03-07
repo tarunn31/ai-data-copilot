@@ -6,3 +6,4 @@ matplotlib
 openai
 python-dotenv
 openpyxl
+scikit-learn
