@@ -30,11 +30,10 @@ st.set_page_config(page_title="AI Data Copilot", layout="wide")
 st.title("🤖 AI Data Analyst Copilot")
 
 st.markdown("""
-Upload a dataset (CSV or Excel) and let the AI analyze it.
 
 This app can:
-- 📊 Automatically generate KPI dashboards
 - 🔎 Explore dataset structure and quality
+- 📊 Automatically generate KPI dashboards
 - 💬 Answer questions about your data using AI
 - 📈 Provide executive insights
 
@@ -77,7 +76,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🤖 AI Data Analyst Copilot")
 st.caption("Upload a file → explore → ask anything → get instant analysis.")
 
 # ----------------------------
